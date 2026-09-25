@@ -1,5 +1,5 @@
 /* Revisa Residência — service worker (app shell offline) */
-const VERSION = 'revisa-v3.0.0';
+const VERSION = 'revisa-v4.0.0';
 const SHELL = [
   './',
   './index.html',

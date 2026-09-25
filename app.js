@@ -203,7 +203,8 @@ function derive(s) {
   d.status = s.concluido ? 'Concluído' : !s.estudoRealizado ? 'A estudar' : !d.proximaData ? 'Estudado' : d.proximaAtividade === 'TEORIA' ? 'Revisar teoria' : d.proximaAtividade === 'MANUTENCAO' ? 'Manutenção' : 'Em revisão';
   d.prazo = d.proximaData ? prazo(d.proximaData) : 'sem'; d.diasAtraso = d.prazo === 'atrasada' ? diffDays(d.proximaData, todayISO()) : 0;
   d.coluna = s.concluido ? 'concluido' : !s.estudoRealizado ? 'assuntos' : !d.proximaData ? 'estudado'
-    : (d.proximaAtividade === 'TEORIA' || d.prazo !== 'futura') ? 'revisar' : d.proximaAtividade === 'MANUTENCAO' ? 'concluido' : d.numRevisoes === 0 ? 'estudado' : 'revisado';
+    : (d.numRevisoes === 0 || d.proximaAtividade === 'TEORIA' || d.proximaAtividade === 'QUESTOES_POS_TEORIA' || d.prazo !== 'futura') ? 'revisar'
+    : d.proximaAtividade === 'MANUTENCAO' ? 'concluido' : 'revisado';
   return d;
 }
 const allDerived = () => state.subjects.map(s => ({ s, d: derive(s) }));
@@ -236,7 +237,7 @@ function desfazerUltima(subjectId) {
   const s = findSubject(subjectId); if (s && s.ajuste) { s.ajuste = null; dbUpsertSubject(s); }
   save(); return true;
 }
-function ajustarData(subjectId, iso) { const s = findSubject(subjectId); s.concluido = false; const d = derive(s); s.ajuste = { ref: d.ref, data: iso }; dbUpsertSubject(s); save(); }
+function ajustarData(subjectId, iso) { const s = findSubject(subjectId); s.concluido = false; if (!s.estudoRealizado) { s.dataEstudo = iso; s.ajuste = null; dbUpsertSubject(s); save(); return; } const d = derive(s); s.ajuste = { ref: d.ref, data: iso }; dbUpsertSubject(s); save(); }
 const normNome = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
 function importarLista() {
   const L = window.REVISA_ASSUNTOS || []; const existentes = new Set(state.subjects.map(s => normNome(s.assunto))); const novos = [];
@@ -272,12 +273,113 @@ function metrics() {
   return { hoje, atrasadas, prox7, teoria, dominioAlto, media, noMes, noPrazo, total: state.subjects.length, all, ag };
 }
 
+/* ===================== ANÁLISE E PLANO ===================== */
+const qReviews = () => state.history.filter(h => isQuestoes(h.tipo) && Number(h.questoes) > 0);
+function agg(list) {
+  const q = list.reduce((a, h) => a + (Number(h.questoes) || 0), 0); const a = list.reduce((x, h) => x + (Number(h.acertos) || 0), 0);
+  return { q, a, e: q - a, n: list.length, pct: q ? Math.round(a / q * 100) : null };
+}
+// compara os últimos 30 dias com os 30 anteriores (precisa de pelo menos 5 questões em cada janela)
+function tendencia(list) {
+  const t = todayISO(), a30 = addDays(t, -30), a60 = addDays(t, -60);
+  const rec = agg(list.filter(h => h.dataRealizada > a30)), ant = agg(list.filter(h => h.dataRealizada > a60 && h.dataRealizada <= a30));
+  if (rec.q < 5 || ant.q < 5) return { tend: 0, diff: null };
+  const diff = rec.pct - ant.pct; return { tend: diff >= 5 ? 1 : diff <= -5 ? -1 : 0, diff };
+}
+const tendTxt = t => t.diff == null ? '<span class="muted">sem comparação ainda</span>' : t.tend > 0 ? `<span class="tend-up">↗ +${t.diff} pts</span>` : t.tend < 0 ? `<span class="tend-down">↘ ${t.diff} pts</span>` : '<span class="muted">→ estável</span>';
+const nivelDePct = pct => pct == null ? 0 : Math.min(5, faixaIndex(pct) + 1);
+function semanas(n) { const ws = weekStart(todayISO()); const out = []; for (let i = n - 1; i >= 0; i--) out.push(addDays(ws, -7 * i)); return out; }
+const serieSemanal = (list, n = 12) => semanas(n).map(w => Object.assign({ w }, agg(list.filter(h => weekStart(h.dataRealizada) === w))));
+function statsDisciplinas(all) {
+  const map = {}; const qh = qReviews();
+  all.forEach(x => {
+    const k = x.s.disciplina; const m = map[k] || (map[k] = { nome: k, itens: [], total: 0, estudados: 0, atrasadas: 0, teoria: 0 });
+    m.itens.push(x); m.total++; if (x.s.estudoRealizado) m.estudados++; if (x.d.prazo === 'atrasada') m.atrasadas++; if (x.d.proximaData && x.d.proximaAtividade === 'TEORIA') m.teoria++;
+  });
+  return Object.values(map).map(m => {
+    const ids = new Set(m.itens.map(x => x.s.id)); m.hist = qh.filter(h => ids.has(h.subjectId)); m.g = agg(m.hist); m.t = tendencia(m.hist);
+    m.cob = m.total ? Math.round(m.estudados / m.total * 100) : 0; m.fracos = m.itens.filter(x => x.d.ultimoPct != null && x.d.ultimoPct < 70).length; return m;
+  });
+}
+function situacao(g) { if (g.q < 10) return { txt: 'Poucos dados', cls: '' }; const n = nivelDePct(g.pct); return n >= 4 ? { txt: 'Forte', cls: 's-feita' } : n === 3 ? { txt: 'Regular', cls: 's-hoje' } : { txt: 'Precisa de gás', cls: 's-atrasada' }; }
+const chipSit = g => { const s = situacao(g); return `<span class="chip ${s.cls}">${s.txt}</span>`; };
+const gasDisc = m => (m.g.q >= 10 ? 100 - m.g.pct : 25) + m.atrasadas * 4 + m.fracos * 4 + m.teoria * 6 + (m.t.tend < 0 ? 10 : 0);
+// assuntos que pedem atenção, com os motivos
+function prioridades(all) {
+  const out = [];
+  all.forEach(x => {
+    const { s, d } = x; if (s.concluido || !s.estudoRealizado) return; const motivos = []; let score = 0;
+    const qs = d.hist.filter(h => isQuestoes(h.tipo));
+    if (d.proximaData && d.proximaAtividade === 'TEORIA') { motivos.push('revisar a teoria'); score += 40; }
+    if (d.ultimoPct != null && d.ultimoPct < 70) { motivos.push(`${pctFmt(d.ultimoPct)} na última bateria`); score += 80 - d.ultimoPct; }
+    if (d.nivel.tend < 0 && qs.length >= 2) { motivos.push(`caiu de ${pctFmt(qs[Math.max(0, qs.length - 3)].pct)} para ${pctFmt(d.ultimoPct)}`); score += 20; }
+    if (d.prazo === 'atrasada') { motivos.push(`${d.numRevisoes ? 'revisão' : '1ª revisão'} atrasada ${d.diasAtraso} ${d.diasAtraso === 1 ? 'dia' : 'dias'}`); score += Math.min(30, 5 + d.diasAtraso * 3); }
+    if (motivos.length) out.push({ x, score, motivos });
+  });
+  return out.sort((a, b) => b.score - a.score);
+}
+function diasSeguidos() {
+  const dias = new Set(state.history.map(h => h.dataRealizada)); state.subjects.forEach(s => { if (s.estudoRealizado && s.dataEstudo) dias.add(s.dataEstudo); });
+  let d = todayISO(); if (!dias.has(d)) d = addDays(d, -1); let n = 0; while (dias.has(d)) { n++; d = addDays(d, -1); } return n;
+}
+// ---------- plano de estudos
+const plano = () => Object.assign({ dataProva: null, novosPorDia: 2, revisoesPorDia: 5, dias: [1, 2, 3, 4, 5, 6] }, cfg().plano || {});
+function proximoDiaEstudo(iso, dias) { let d = iso; for (let i = 0; i < 7; i++) { if (dias.includes(parseISO(d).getDay())) return d; d = addDays(d, 1); } return iso; }
+function slots(inicio, porDia, n, dias) { const out = []; let d = proximoDiaEstudo(inicio, dias), c = 0; for (let i = 0; i < n; i++) { if (c >= porDia) { d = proximoDiaEstudo(addDays(d, 1), dias); c = 0; } out.push(d); c++; } return out; }
+function diasEstudoEntre(a, b, dias) { let n = 0, d = a; while (d <= b) { if (dias.includes(parseISO(d).getDay())) n++; d = addDays(d, 1); } return n; }
+// espalha cada matéria ao longo da fila, para não estudar uma matéria inteira de uma vez
+function intercalar(subs) {
+  const cnt = {}, pos = {}; subs.forEach(s => { cnt[s.disciplina] = (cnt[s.disciplina] || 0) + 1; });
+  return subs.map(s => { pos[s.disciplina] = (pos[s.disciplina] ?? -1) + 1; return { s, k: (pos[s.disciplina] + 0.5) / cnt[s.disciplina] }; })
+    .sort((a, b) => a.k - b.k || a.s.disciplina.localeCompare(b.s.disciplina, 'pt')).map(o => o.s);
+}
+function filaNovos(all) {
+  const pend = all.filter(x => !x.s.estudoRealizado && !x.s.concluido);
+  const marcados = pend.filter(x => x.s.dataEstudo).sort((a, b) => a.s.dataEstudo.localeCompare(b.s.dataEstudo) || a.s.numero - b.s.numero).map(x => x.s);
+  return marcados.concat(intercalar(pend.filter(x => !x.s.dataEstudo).sort((a, b) => a.s.numero - b.s.numero).map(x => x.s)));
+}
+const filaPrimeiras = all => intercalar(all.filter(x => x.s.estudoRealizado && !x.s.concluido && x.d.numRevisoes === 0 && !x.d.proximaData).map(x => x.s).sort((a, b) => a.numero - b.numero));
+function planejar(p, inicio) {
+  const all = allDerived(); const mudou = new Set(); const res = {};
+  if (p.novosPorDia > 0) {
+    const fila = filaNovos(all); const datas = slots(inicio, p.novosPorDia, fila.length, p.dias);
+    fila.forEach((s, i) => { if (s.dataEstudo !== datas[i] || s.ajuste) { s.dataEstudo = datas[i]; s.ajuste = null; mudou.add(s); } });
+    if (fila.length) res.novos = { n: fila.length, fim: datas[datas.length - 1] };
+  }
+  if (p.revisoesPorDia > 0) {
+    const fila = filaPrimeiras(all); const datas = slots(inicio, p.revisoesPorDia, fila.length, p.dias);
+    fila.forEach((s, i) => { s.ajuste = { ref: 'inicio', data: datas[i] }; mudou.add(s); });
+    if (fila.length) res.rev = { n: fila.length, fim: datas[datas.length - 1] };
+  }
+  if (mudou.size) dbUpsertSubjects(Array.from(mudou)); save(true); return res;
+}
+const resumoPlano = r => [r.novos ? `${r.novos.n} estudos até ${fmtBR(r.novos.fim)}` : '', r.rev ? `${r.rev.n} revisões até ${fmtBR(r.rev.fim)}` : ''].filter(Boolean).join(' · ') || 'Plano salvo';
+const haDias = n => n <= 0 ? 'hoje' : n === 1 ? 'ontem' : `há ${n} dias`;
+const quandoTxt = d => d.prazo === 'atrasada' ? `atrasada ${d.diasAtraso} ${d.diasAtraso === 1 ? 'dia' : 'dias'} (era ${fmtBR(d.proximaData)})` : d.prazo === 'hoje' ? 'hoje' : d.proximaData === addDays(todayISO(), 1) ? `amanhã, ${fmtDia(d.proximaData)}` : `${fmtDia(d.proximaData)}, em ${diffDays(todayISO(), d.proximaData)} dias`;
+function proximoPasso(s, d) {
+  const c = cfg(); const cls = statusCls({ s, d });
+  if (s.concluido) return { titulo: 'Concluído', quando: 'fora da agenda', porque: 'Você marcou este assunto como concluído. Reative para ele voltar a gerar revisões.', cls: 's-feita' };
+  if (!s.estudoRealizado) return { titulo: 'Estudar a teoria', quando: d.proximaData ? quandoTxt(d) : 'ainda sem data no plano', porque: 'Depois do estudo, a 1ª revisão por questões entra na agenda em 24 a 48 horas.', cls };
+  if (!d.proximaData) return { titulo: 'Marcar a 1ª revisão', quando: 'sem data', porque: 'A teoria já foi vista, mas a revisão por questões ainda não tem data. Escolha uma abaixo ou use Meu plano para distribuir.', cls: '' };
+  let porque;
+  if (!d.numRevisoes) porque = s.dataEstudo ? `1ª revisão por questões depois do estudo de ${fmtBR(s.dataEstudo)}.` : '1ª revisão por questões do conteúdo já estudado.';
+  else if (d.last.tipo === 'TEORIA') porque = 'Teoria revisada. Agora confirme com uma nova bateria de questões.';
+  else {
+    const f = faixaFor(d.last.pct);
+    porque = d.proximaAtividade === 'TEORIA' ? `Você fez ${pctFmt(d.last.pct)} na última bateria, abaixo de ${c.limiteTeoria}%. Releia a teoria antes de novas questões.`
+      : d.proximaAtividade === 'MANUTENCAO' ? `Acima de ${c.faixas[c.faixas.length - 1].min}% em sequência: revisão de manutenção a cada ${d.intervalo} dias.`
+      : `Último resultado ${pctFmt(d.last.pct)} (${f.nome.toLowerCase()}): próxima em ${d.intervalo} dias, faixa de ${f.intMin} a ${f.intMax}.`;
+  }
+  if (d.ajustada) porque += ' Data ajustada manualmente.';
+  return { titulo: TIPOS[d.proximaAtividade].label, quando: quandoTxt(d), porque, cls };
+}
+
 /* ===================== UI: infra ===================== */
 const view = $('#view');
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2800); }
-function openModal(html, onMount) {
+function openModal(html, onMount, opts = {}) {
   const root = $('#modal-root');
-  root.innerHTML = `<div class="modal-bg" id="modal-bg"><div class="modal" role="dialog" aria-modal="true">${html}</div></div>`;
+  root.innerHTML = `<div class="modal-bg" id="modal-bg"><div class="modal${opts.size === 'lg' ? ' modal-lg' : ''}" role="dialog" aria-modal="true">${html}</div></div>`;
   const bg = $('#modal-bg'); bg.addEventListener('click', e => { if (e.target === bg) closeModal(); });
   $$('[data-close]', bg).forEach(b => b.addEventListener('click', closeModal));
   document.body.style.overflow = 'hidden'; if (onMount) onMount(bg);
@@ -299,16 +401,17 @@ function acaoLabel(t) { return t === 'ESTUDO' ? 'Estudo feito' : t === 'TEORIA' 
 
 function render() {
   if (!user) return;
+  if (state.ui.tab === 'assuntos') state.ui.tab = 'materias';
   const tab = state.ui.tab || 'agenda';
   $$('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   $('.content').classList.toggle('wide', tab === 'agenda' && state.ui.agendaMode === 'kanban');
   const m = metrics(); const badge = m.atrasadas + m.hoje;
   const tabA = $('#tab-agenda'); let bd = $('.badge', tabA); if (badge > 0) { if (!bd) { bd = document.createElement('span'); bd.className = 'badge'; tabA.appendChild(bd); } bd.textContent = badge; } else if (bd) bd.remove();
   $('#topbar-date').textContent = fmtDiaLongo(todayISO());
-  const titles = { agenda: 'Agenda', painel: 'Painel', assuntos: 'Banco de assuntos', historico: 'Histórico', config: 'Configurações' };
+  const titles = { agenda: 'Agenda', painel: 'Painel', materias: 'Matérias', historico: 'Histórico', config: 'Configurações' };
   $('#page-title').textContent = titles[tab];
   if (!state.loaded && !state.cached) { view.innerHTML = `<div class="empty">Carregando seus dados…</div>`; return; }
-  ({ agenda: renderAgenda, painel: renderPainel, assuntos: renderAssuntos, historico: renderHistorico, config: renderConfig })[tab](m);
+  ({ agenda: renderAgenda, painel: renderPainel, materias: renderMaterias, historico: renderHistorico, config: renderConfig })[tab](m);
 }
 
 /* ===================== AGENDA ===================== */
@@ -332,19 +435,98 @@ function renderAgenda(m) {
   bindItems(view); if (mode === 'mes') bindMes(); if (mode === 'kanban') bindKanban();
 }
 function agendaLista(m) {
-  const t = todayISO();
-  const all = m.ag.slice().sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData) || a.s.disciplina.localeCompare(b.s.disciplina));
-  const atras = all.filter(x => x.d.prazo === 'atrasada'); const hoje = all.filter(x => x.d.prazo === 'hoje'); const prox = all.filter(x => x.d.proximaData > t && x.d.proximaData <= addDays(t, 7));
-  let h = `<div class="summary"><span class="pill s-atrasada">${atras.length} atrasada${atras.length === 1 ? '' : 's'}</span><span class="pill s-hoje">${hoje.length} hoje</span><span class="pill">${prox.length} nos próximos 7 dias</span>${m.teoria ? `<span class="pill s-teoria">${m.teoria} p/ revisar teoria</span>` : ''}</div>`;
-  if (!state.subjects.length) { h += `<div class="empty"><p><strong>Nenhum assunto cadastrado ainda.</strong></p><p style="margin-top:6px">Cadastre o primeiro assunto estudado e a primeira revisão será programada automaticamente.</p><div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap"><button class="primary" id="empty-novo">+ Novo assunto</button><button id="empty-exemplo">Carregar exemplos</button></div></div>`; return h; }
-  const semAgenda = m.all.filter(x => x.d.coluna === 'estudado' && !x.d.proximaData).length;
-  if (semAgenda) h += `<div class="hint"><span><strong>${semAgenda}</strong> ${semAgenda === 1 ? 'assunto estudado ainda está' : 'assuntos estudados ainda estão'} sem revisão agendada.</span><button class="sm" id="go-kanban">Abrir Kanban</button></div>`;
-  if (atras.length) h += `<section class="section"><div class="section-head"><h2>Atrasadas</h2><span class="count">${atras.length}</span></div><div class="stack">${atras.map(x => itemHTML(x)).join('')}</div></section>`;
-  h += `<section class="section"><div class="section-head"><h2>Hoje · ${fmtDia(t)}</h2><span class="count">${hoje.length}</span></div>${hoje.length ? `<div class="stack">${hoje.map(x => itemHTML(x)).join('')}</div>` : `<div class="empty">Nada programado para hoje${atras.length ? ' — aproveite para colocar as atrasadas em dia' : ''}.</div>`}</section>`;
+  const t = todayISO(); const p = plano();
+  if (!state.subjects.length) return `<div class="empty"><p><strong>Nenhum assunto cadastrado ainda.</strong></p><p style="margin-top:6px">Cadastre o primeiro assunto estudado e a primeira revisão será programada automaticamente.</p><div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap"><button class="primary" id="empty-novo">+ Novo assunto</button><button id="empty-exemplo">Carregar exemplos</button></div></div>`;
+  const ag = m.ag.slice().sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData) || a.s.disciplina.localeCompare(b.s.disciplina, 'pt'));
+  const pend = ag.filter(x => x.d.prazo !== 'futura');
+  const teoria = pend.filter(x => x.d.proximaAtividade === 'TEORIA');
+  const questoes = pend.filter(x => isQuestoes(x.d.proximaAtividade));
+  const estudar = pend.filter(x => x.d.proximaAtividade === 'ESTUDO');
+  const histHoje = state.history.filter(h => h.dataRealizada === t);
+  const feitos = histHoje.length + state.subjects.filter(s => s.estudoRealizado && s.dataEstudo === t).length;
+  const total = feitos + pend.length; const pct = total ? Math.round(feitos / total * 100) : 0;
+  const metaQ = questoes.length * cfg().questoesRecomendadas; const qHoje = histHoje.reduce((a, h) => a + (Number(h.questoes) || 0), 0);
+  const falta = p.dataProva ? diffDays(t, p.dataProva) : null;
+  const sub = [feitos ? `${feitos} ${feitos === 1 ? 'feita' : 'feitas'}` : '', questoes.length ? `meta de ~${metaQ} questões` : '', qHoje ? `${qHoje} questões feitas hoje` : '', falta != null && falta >= 0 ? `faltam ${falta} dias para a prova` : ''].filter(Boolean).join(' · ');
+  let h = `<section class="plan-card"><div class="plan-top"><div><span class="eyebrow">Plano de hoje · ${fmtDia(t)}</span><h2>${pend.length ? `${pend.length} ${pend.length === 1 ? 'atividade' : 'atividades'} para fazer` : feitos ? 'Tudo feito por hoje' : 'Nada marcado para hoje'}</h2><p class="small muted">${sub || 'Use Meu plano para o app organizar seus dias de estudo.'}</p></div><button class="sm" id="btn-plano">Meu plano</button></div>${total ? `<div class="progress" role="progressbar" aria-label="Progresso de hoje" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i></div>` : ''}</section>`;
+  const semData = m.all.filter(x => !x.s.estudoRealizado && !x.s.concluido && !x.s.dataEstudo).length;
+  const semRev = m.all.filter(x => x.d.coluna === 'estudado').length;
+  const estAtras = m.all.filter(x => !x.s.estudoRealizado && !x.s.concluido && x.s.dataEstudo && x.s.dataEstudo < t).length;
+  const hint = (txt, btn, id) => `<div class="hint"><span>${txt}</span><button class="sm primary" id="${id}">${btn}</button></div>`;
+  const faltaTxt = [semData ? `${semData} ${semData === 1 ? 'assunto novo' : 'assuntos novos'} sem data para estudar` : '', semRev ? `${semRev} ${semRev === 1 ? 'estudado' : 'estudados'} sem revisão marcada` : ''].filter(Boolean).join(' e ');
+  if (!cfg().plano && faltaTxt) h += hint(`<strong>Deixe o app organizar seus estudos.</strong> Há ${faltaTxt}.`, 'Montar meu plano', 'hint-plano');
+  else if (estAtras >= 3) h += hint(`<strong>${estAtras} estudos ficaram para trás.</strong> Reorganize o plano a partir de hoje, mantendo a ordem.`, 'Reorganizar', 'hint-replan');
+  else if (faltaTxt) h += hint(`Há ${faltaTxt}.`, 'Encaixar no plano', 'hint-replan');
+  const sec = (titulo, desc, itens) => itens.length ? `<section class="section"><div class="section-head"><div><h2>${titulo}</h2><p class="small muted">${desc}</p></div><span class="count">${itens.length}</span></div><div class="stack">${itens.map(x => itemHTML(x)).join('')}</div></section>` : '';
+  if (!pend.length) h += `<div class="empty section">${feitos ? 'Você fez tudo o que estava marcado para hoje.' : 'Nada marcado para hoje.'}</div>`;
+  h += sec('Revisar teoria', `Acerto abaixo de ${cfg().limiteTeoria}% na última bateria: releia antes de novas questões.`, teoria);
+  h += sec('Questões', 'Revisões por questões de hoje e atrasadas, das mais antigas para as mais novas.', questoes);
+  h += sec('Estudar teoria nova', 'Assuntos novos do seu plano para hoje.', estudar);
+  const prox = ag.filter(x => x.d.proximaData > t && x.d.proximaData <= addDays(t, 7));
   h += `<section class="section"><div class="section-head"><h2>Próximos 7 dias</h2><span class="count">${prox.length}</span></div>`;
-  if (!prox.length) h += `<div class="empty">Nenhuma revisão nos próximos 7 dias.</div>`;
-  else { let cur = null; prox.forEach(x => { if (x.d.proximaData !== cur) { if (cur) h += `</div>`; cur = x.d.proximaData; const n = prox.filter(y => y.d.proximaData === cur).length; h += `<div class="day-head">${fmtDia(cur)} <span class="n">${n} ${n === 1 ? 'atividade' : 'atividades'}</span></div><div class="stack">`; } h += itemHTML(x); }); h += `</div>`; }
+  if (!prox.length) h += `<div class="empty">Nada marcado para os próximos 7 dias.</div>`;
+  else {
+    let cur = null;
+    prox.forEach(x => {
+      if (x.d.proximaData !== cur) {
+        if (cur) h += `</div>`; cur = x.d.proximaData; const dia = prox.filter(y => y.d.proximaData === cur);
+        const nE = dia.filter(y => y.d.proximaAtividade === 'ESTUDO').length, nR = dia.length - nE;
+        h += `<div class="day-head">${fmtDia(cur)} <span class="n">${[nR ? `${nR} ${nR === 1 ? 'revisão' : 'revisões'}` : '', nE ? `${nE} ${nE === 1 ? 'estudo novo' : 'estudos novos'}` : ''].filter(Boolean).join(' · ')}</span></div><div class="stack">`;
+      }
+      h += itemHTML(x);
+    });
+    h += `</div>`;
+  }
   return h + `</section>`;
+}
+function modalPlano() {
+  const p = plano(); const t = todayISO(); const all = allDerived();
+  const nNovos = filaNovos(all).length, nRev = filaPrimeiras(all).length;
+  const DN = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
+  openModal(`<form id="f-plano" class="stack" style="gap:12px"><h2>Meu plano de estudos</h2>
+    <p class="small muted">O app distribui pelos seus dias de estudo os assuntos que faltam estudar e as primeiras revisões ainda sem data. As revisões seguintes continuam automáticas, pelo seu desempenho.</p>
+    <div class="row2"><label>Data da prova<input type="date" name="prova" value="${p.dataProva || ''}"></label><label>Começar em<input type="date" name="inicio" value="${t}" min="${t}" required></label></div>
+    <div class="row2"><label>Assuntos novos por dia<input type="number" name="novos" min="0" max="20" value="${p.novosPorDia}" inputmode="numeric" required></label><label>1ªs revisões pendentes por dia<input type="number" name="rev" min="0" max="50" value="${p.revisoesPorDia}" inputmode="numeric" required></label></div>
+    <div><span class="eyebrow">Dias de estudo</span><div class="dias-sel">${DN.map((n, i) => `<label class="dia"><input type="checkbox" name="dia" value="${i}" ${p.dias.includes(i) ? 'checked' : ''}><span>${n}</span></label>`).join('')}</div></div>
+    <div class="preview" id="plano-prev"></div>
+    <div class="actions"><button type="button" data-close>Cancelar</button><button class="primary" type="submit">Organizar minha agenda</button></div></form>`, () => {
+    const f = $('#f-plano');
+    const ler = () => ({ dataProva: f.prova.value || null, novosPorDia: Math.max(0, Number(f.novos.value) || 0), revisoesPorDia: Math.max(0, Number(f.rev.value) || 0), dias: $$('input[name=dia]:checked', f).map(i => Number(i.value)) });
+    const prev = () => {
+      const q = ler(); const ini = f.inicio.value || t; const el = $('#plano-prev');
+      if (!q.dias.length) { el.innerHTML = '<span class="txt-red">Escolha pelo menos um dia de estudo.</span>'; return; }
+      const linhas = [];
+      if (nNovos && q.novosPorDia) {
+        const fim = slots(ini, q.novosPorDia, nNovos, q.dias).pop();
+        linhas.push(`<span><b>${nNovos}</b> assuntos novos, ${q.novosPorDia} por dia: de ${fmtBRFull(proximoDiaEstudo(ini, q.dias))} a <strong>${fmtBRFull(fim)}</strong>.</span>`);
+        if (q.dataProva) {
+          const limite = addDays(q.dataProva, -30);
+          if (fim > limite) { const disp = diasEstudoEntre(ini, limite, q.dias); const need = disp > 0 ? Math.ceil(nNovos / disp) : null; linhas.push(`<span class="txt-red">Passa de ${fmtBRFull(limite)}, 30 dias antes da prova.${need ? ` Para chegar a tempo, estude <button type="button" class="linkbtn" id="usar-ritmo" data-n="${need}">${need} por dia</button>.` : ''}</span>`); }
+          else linhas.push(`<span class="txt-green">A teoria termina ${diffDays(fim, q.dataProva)} dias antes da prova, com tempo para revisar.</span>`);
+        }
+      } else if (nNovos) linhas.push('<span>Assuntos novos não serão agendados (0 por dia).</span>');
+      if (nRev && q.revisoesPorDia) linhas.push(`<span><b>${nRev}</b> primeiras revisões pendentes, ${q.revisoesPorDia} por dia: até <strong>${fmtBRFull(slots(ini, q.revisoesPorDia, nRev, q.dias).pop())}</strong>.</span>`);
+      if (!nNovos && !nRev) linhas.push('<span>Tudo já tem data. Salve para guardar a data da prova e o ritmo.</span>');
+      el.innerHTML = linhas.join('');
+      const u = $('#usar-ritmo'); if (u) u.addEventListener('click', () => { f.novos.value = u.dataset.n; prev(); });
+    };
+    f.addEventListener('input', prev); f.addEventListener('change', prev); prev();
+    f.addEventListener('submit', e => {
+      e.preventDefault(); const q = ler(); if (!q.dias.length) return toast('Escolha pelo menos um dia de estudo.');
+      cfg().plano = q; dbSaveConfig(); const r = planejar(q, f.inicio.value || t); closeModal(); render(); toast(resumoPlano(r));
+    });
+  });
+}
+function modalAgendarRevisao(id) {
+  const s = findSubject(id); if (!s) return; const t = todayISO();
+  openModal(`<form id="f-ag" class="stack" style="gap:12px"><h2>Quando fazer a 1ª revisão?</h2><p class="muted"><span class="eyebrow">${esc(s.disciplina)}</span><br><strong style="color:var(--ink)">${esc(s.assunto)}</strong></p>
+    <div class="quick-dates"><button type="button" data-q="0">Hoje</button><button type="button" data-q="1">Amanhã</button><button type="button" data-q="2">Em 2 dias</button></div>
+    <label>Ou escolha a data<input type="date" name="data" value="${t}" min="${t}" required></label>
+    <div class="actions"><button type="button" data-close>Cancelar</button><button class="primary" type="submit">Marcar revisão</button></div></form>`, bg => {
+    const f = $('#f-ag'); const ok = iso => { ajustarData(id, iso); closeModal(); render(); toast(`Revisão marcada para ${iso === t ? 'hoje' : fmtBR(iso)}`); };
+    $$('[data-q]', bg).forEach(b => b.addEventListener('click', () => ok(addDays(t, Number(b.dataset.q)))));
+    f.addEventListener('submit', e => { e.preventDefault(); if (f.data.value) ok(f.data.value); });
+  });
 }
 function monthItems(mes) {
   const items = [];
@@ -389,15 +571,18 @@ function bindItems(root) {
   $$('[data-open]', root).forEach(el => el.addEventListener('click', () => modalAssunto(el.dataset.open)));
   const en = $('#empty-novo', root); if (en) en.addEventListener('click', () => modalNovoAssunto());
   const ex = $('#empty-exemplo', root); if (ex) ex.addEventListener('click', carregarExemplos);
+  const bp = $('#btn-plano', root); if (bp) bp.addEventListener('click', modalPlano);
+  const hp = $('#hint-plano', root); if (hp) hp.addEventListener('click', modalPlano);
+  const hr = $('#hint-replan', root); if (hr) hr.addEventListener('click', () => { const r = planejar(plano(), todayISO()); render(); toast(resumoPlano(r)); });
   const gk = $('#go-kanban', root); if (gk) gk.addEventListener('click', () => { state.ui.agendaMode = 'kanban'; save(); render(); window.scrollTo({ top: 0 }); });
 }
 
 /* ===================== KANBAN ===================== */
 const COLS = [
-  { id: 'assuntos', nome: 'Assuntos', desc: 'a estudar' },
-  { id: 'estudado', nome: 'Estudado', desc: 'teoria vista' },
-  { id: 'revisar', nome: 'Para revisar', desc: 'hoje, atrasadas e teoria' },
-  { id: 'revisado', nome: 'Revisado', desc: 'próxima revisão agendada' },
+  { id: 'assuntos', nome: 'Assuntos', desc: 'teoria ainda não estudada' },
+  { id: 'estudado', nome: 'Estudado', desc: 'teoria vista, sem revisão marcada' },
+  { id: 'revisar', nome: 'Para revisar', desc: 'revisão marcada e pendente' },
+  { id: 'revisado', nome: 'Revisado', desc: 'em dia, volta na próxima data' },
   { id: 'concluido', nome: 'Concluído', desc: 'domínio consolidado' },
 ];
 const colNome = id => (COLS.find(c => c.id === id) || {}).nome || id;
@@ -426,12 +611,12 @@ function agendaKanban() {
   const porData = (a, b) => (a.d.proximaData || '9999').localeCompare(b.d.proximaData || '9999') || porDisc(a, b);
   let h = `<div class="toolbar"><input class="search" id="k-q" placeholder="Buscar assunto…" value="${esc(f.q || '')}"><select id="k-disc" aria-label="Disciplina"><option value="">Todas as disciplinas</option>${discs.map(d => `<option ${f.disc === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select></div>`;
   if (!state.subjects.length) return h + `<div class="empty"><p><strong>Nenhum assunto ainda.</strong></p><div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap"><button class="primary" id="k-importar">Importar lista de assuntos</button></div></div>`;
-  h += `<p class="small muted" style="margin-bottom:10px">Arraste os cards entre as colunas, ou toque em ⋯ para mover. O que muda aqui muda também na agenda.</p><div class="kanban">`;
+  h += `<details class="kinfo"><summary>Como as colunas funcionam</summary><ul><li><b>Assuntos</b>: ainda não estudou a teoria. Com o plano, cada um ganha uma data para estudar.</li><li><b>Estudado</b>: teoria vista, mas sem revisão marcada. Use Marcar revisões ou o plano.</li><li><b>Para revisar</b>: tem revisão marcada e ainda não feita, seja a 1ª revisão, uma revisão de hoje, uma atrasada ou uma revisão de teoria.</li><li><b>Revisado</b>: revisão feita e em dia. Volta para Para revisar quando chega a próxima data.</li><li><b>Concluído</b>: acerto alto em sequência (manutenção) ou marcado por você.</li></ul><p>Arraste os cards ou toque em ⋯ para mover. O que muda aqui muda também na agenda.</p></details><div class="kanban">`;
   COLS.forEach(c => {
-    const items = list.filter(x => x.d.coluna === c.id).sort(c.id === 'assuntos' || c.id === 'concluido' ? porDisc : porData);
+    const items = list.filter(x => x.d.coluna === c.id).sort(c.id === 'concluido' ? porDisc : porData);
     const semData = c.id === 'estudado' ? items.filter(x => !x.d.proximaData && x.d.numRevisoes === 0).length : 0;
     h += `<section class="kcol" data-col="${c.id}"><header class="kcol-head"><div><h3>${c.nome}</h3><span class="small muted">${c.desc}</span></div><span class="kcount num">${items.length}</span></header>`;
-    if (semData) h += `<div class="kcol-tools"><button class="sm primary" id="k-lote">Agendar ${semData} ${semData === 1 ? 'revisão' : 'revisões'}</button></div>`;
+    if (semData) h += `<div class="kcol-tools"><button class="sm primary" id="k-lote">Marcar ${semData} ${semData === 1 ? 'revisão' : 'revisões'}</button></div>`;
     h += `<div class="kcol-body" data-drop="${c.id}">${items.length ? items.map(kanbanCard).join('') : '<div class="kempty">Arraste um card para cá</div>'}</div></section>`;
   });
   return h + `</div>`;
@@ -471,68 +656,91 @@ function moveTo(id, col) {
     if (d.numRevisoes) return toast('Este assunto já foi revisado. Ele só volta para Estudado se as revisões forem desfeitas no Histórico.');
     s.concluido = false; s.ajuste = { ref: 'inicio', semAgenda: true }; return done('Revisão retirada da agenda');
   }
-  if (col === 'revisar') { s.concluido = false; const d2 = derive(s); s.ajuste = { ref: d2.ref, data: t }; return done(`${TIPOS[d2.proximaAtividade].label} agendada para hoje`); }
+  if (col === 'revisar') { if (!d.numRevisoes) return modalAgendarRevisao(id); s.concluido = false; const d2 = derive(s); s.ajuste = { ref: d2.ref, data: t }; return done(`${TIPOS[d2.proximaAtividade].label} antecipada para hoje`); }
   if (col === 'revisado') return modalRegistrar(id);
 }
 function modalMover(id) {
   const s = findSubject(id); if (!s) return; const d = derive(s);
-  const acao = { assuntos: 'volta a estudar e sai da agenda', estudado: s.estudoRealizado ? 'tira a revisão da agenda' : 'registra o estudo da teoria', revisar: s.estudoRealizado ? 'agenda a revisão para hoje' : 'registra o estudo da teoria', revisado: s.estudoRealizado ? 'registra questões e acertos' : 'registra o estudo da teoria', concluido: 'sai da agenda' };
+  const acao = { assuntos: 'volta a estudar e sai da agenda', estudado: s.estudoRealizado ? 'tira a revisão da agenda' : 'registra o estudo da teoria', revisar: s.estudoRealizado ? (d.numRevisoes ? 'antecipa a revisão para hoje' : 'escolhe a data da 1ª revisão') : 'registra o estudo da teoria', revisado: s.estudoRealizado ? 'registra questões e acertos' : 'registra o estudo da teoria', concluido: 'sai da agenda' };
   openModal(`<div class="stack" style="gap:12px"><div><span class="eyebrow">${esc(s.disciplina)}</span><h2>${esc(s.assunto)}</h2><p class="small muted">Está em <strong>${colNome(d.coluna)}</strong>. Mover para:</p></div><div class="move-list">${COLS.map(c => `<button data-col="${c.id}" ${c.id === d.coluna ? 'disabled' : ''}>${c.nome}<small>${c.id === d.coluna ? 'coluna atual' : acao[c.id]}</small></button>`).join('')}</div><div class="actions"><button data-close>Cancelar</button></div></div>`, bg => {
     $$('[data-col]', bg).forEach(b => b.addEventListener('click', () => { closeModal(); moveTo(id, b.dataset.col); }));
   });
 }
-function distribuirLote(subs, porDia, inicio) {
-  const grupos = {}; subs.forEach(s => (grupos[s.disciplina] = grupos[s.disciplina] || []).push(s));
-  const filas = Object.values(grupos); const ordem = [];
-  while (filas.some(f => f.length)) filas.forEach(f => { if (f.length) ordem.push(f.shift()); });
-  return ordem.map((s, i) => ({ s, data: addDays(inicio, Math.floor(i / porDia)) }));
-}
 function modalAgendarLote(subs) {
-  if (!subs.length) return toast('Nenhum assunto estudado sem revisão.'); const t = todayISO();
-  openModal(`<form id="f-lote" class="stack" style="gap:12px"><h2>Agendar revisões</h2><p class="small muted">${subs.length} ${subs.length === 1 ? 'assunto estudado está' : 'assuntos estudados estão'} sem revisão agendada. O app distribui as primeiras revisões por questões ao longo dos dias, alternando as disciplinas.</p>
-    <div class="row2"><label>Revisões por dia<input type="number" name="porDia" min="1" max="50" value="5" inputmode="numeric" required></label><label>A partir de<input type="date" name="inicio" value="${t}" required></label></div>
-    <div class="preview" id="lote-prev"></div><div class="actions"><button type="button" data-close>Cancelar</button><button class="primary" type="submit">Agendar</button></div></form>`, () => {
+  if (!subs.length) return toast('Nenhum assunto estudado sem revisão.'); const t = todayISO(); const p = plano();
+  openModal(`<form id="f-lote" class="stack" style="gap:12px"><h2>Marcar revisões</h2><p class="small muted">${subs.length} ${subs.length === 1 ? 'assunto estudado está' : 'assuntos estudados estão'} sem revisão marcada. O app distribui as primeiras revisões por questões nos seus dias de estudo, alternando as matérias. Os cards vão para Para revisar.</p>
+    <div class="row2"><label>Revisões por dia<input type="number" name="porDia" min="1" max="50" value="${p.revisoesPorDia || 5}" inputmode="numeric" required></label><label>A partir de<input type="date" name="inicio" value="${t}" min="${t}" required></label></div>
+    <div class="preview" id="lote-prev"></div><div class="actions"><button type="button" data-close>Cancelar</button><button class="primary" type="submit">Marcar revisões</button></div></form>`, () => {
     const f = $('#f-lote');
-    const prev = () => { const n = Math.max(1, Number(f.porDia.value) || 1); const ini = f.inicio.value || t; const dias = Math.ceil(subs.length / n); $('#lote-prev').innerHTML = `<span>${subs.length} ${subs.length === 1 ? 'revisão' : 'revisões'}, ${n} por dia: de <strong class="num">${fmtBRFull(ini)}</strong> a <strong class="num">${fmtBRFull(addDays(ini, dias - 1))}</strong> (${dias} ${dias === 1 ? 'dia' : 'dias'}).</span>`; };
+    const prev = () => { const n = Math.max(1, Number(f.porDia.value) || 1); const ini = f.inicio.value || t; const ds = slots(ini, n, subs.length, p.dias); $('#lote-prev').innerHTML = `<span>${subs.length} ${subs.length === 1 ? 'revisão' : 'revisões'}, ${n} por dia de estudo: de <strong class="num">${fmtBRFull(ds[0])}</strong> a <strong class="num">${fmtBRFull(ds[ds.length - 1])}</strong>.</span>`; };
     f.porDia.addEventListener('input', prev); f.inicio.addEventListener('input', prev); prev();
     f.addEventListener('submit', e => {
       e.preventDefault(); const n = Math.max(1, Number(f.porDia.value) || 1);
-      const plano = distribuirLote(subs, n, f.inicio.value || t);
-      plano.forEach(({ s, data }) => { s.ajuste = { ref: 'inicio', data }; s.concluido = false; });
-      dbUpsertSubjects(plano.map(p => p.s)); save(true); closeModal(); render(); toast(`${plano.length} revisões agendadas`);
+      const fila = intercalar(subs.slice().sort((a, b) => a.numero - b.numero)); const datas = slots(f.inicio.value || t, n, fila.length, p.dias);
+      fila.forEach((s, i) => { s.ajuste = { ref: 'inicio', data: datas[i] }; s.concluido = false; });
+      dbUpsertSubjects(fila); save(true); closeModal(); render(); toast(`${fila.length} revisões marcadas até ${fmtBR(datas[datas.length - 1])}`);
     });
   });
 }
 
 /* ===================== PAINEL ===================== */
 function renderPainel(m) {
-  const tiles = [
-    { v: m.hoje, l: 'Revisões para hoje', cls: 'today' }, { v: m.atrasadas, l: 'Revisões atrasadas', cls: m.atrasadas ? 'alert' : '' }, { v: m.prox7, l: 'Próximos 7 dias', cls: '' },
-    { v: m.total, l: 'Assuntos cadastrados', cls: '' }, { v: m.dominioAlto, l: 'Assuntos com domínio alto (🟢🔵)', cls: 'good' }, { v: m.teoria, l: 'Precisam de revisão teórica', cls: m.teoria ? 'theory' : '' },
-    { v: pctFmt(m.media), l: 'Média geral de acertos', cls: '' }, { v: m.noMes, l: `Revisões em ${MESES[Number(todayISO().slice(5, 7)) - 1]}`, cls: '' }, { v: m.noPrazo == null ? '—' : m.noPrazo + '%', l: 'Revisões feitas no prazo', cls: '' },
+  const t = todayISO(); const p = plano(); const qh = qReviews(); const G = agg(qh); const tr = tendencia(qh);
+  const est = m.all.filter(x => x.s.estudoRealizado).length; const cob = m.total ? Math.round(est / m.total * 100) : 0; const seq = diasSeguidos();
+  const ds = statsDisciplinas(m.all); const pri = prioridades(m.all);
+  let h = '';
+  if (p.dataProva) {
+    const falta = diffDays(t, p.dataProva); const fimNovos = m.all.filter(x => !x.s.estudoRealizado && !x.s.concluido && x.s.dataEstudo).map(x => x.s.dataEstudo).sort().pop();
+    h += `<section class="prova-card"><div><span class="eyebrow">Prova · ${fmtBRFull(p.dataProva)}</span><strong>${falta > 0 ? `Faltam ${falta} dias` : falta === 0 ? 'É hoje' : 'Prova realizada'}</strong></div><div class="small">${fimNovos ? `No ritmo do plano, a teoria termina em <strong>${fmtBRFull(fimNovos)}</strong>.` : est === m.total ? 'Toda a teoria já foi vista.' : 'Monte o plano para ver quando a teoria termina.'}</div></section>`;
+  }
+  const hero = [
+    { v: `${cob}%`, l: `da teoria vista · ${est} de ${m.total} assuntos`, bar: cob },
+    { v: pctFmt(G.pct), l: `acerto geral · ${tendTxt(tr)}` },
+    { v: G.q, l: `questões feitas · ${G.a} acertos · ${G.e} erros` },
+    { v: seq, l: seq === 1 ? 'dia seguido estudando' : 'dias seguidos estudando' },
   ];
-  let h = `<div class="grid metrics section">${tiles.map(t => `<div class="metric ${t.cls}"><span class="v">${t.v}</span><span class="l">${t.l}</span></div>`).join('')}</div><div class="charts section">`;
-  h += `<div class="card chart-card"><h3>Evolução da porcentagem de acertos</h3><p class="small muted" style="margin-bottom:8px">Cada ponto é uma revisão por questões, em ordem cronológica.</p>${chartEvolucao()}<div class="tip" id="tip-evo"></div></div>`;
+  h += `<div class="grid hero section">${hero.map(x => `<div class="metric"><span class="v num">${x.v}</span><span class="l">${x.l}</span>${x.bar != null ? `<div class="progress sm"><i style="width:${x.bar}%"></i></div>` : ''}</div>`).join('')}</div>`;
+  const strip = [[m.hoje, 'para hoje', m.hoje ? 'today' : ''], [m.atrasadas, 'atrasadas', m.atrasadas ? 'alert' : ''], [m.prox7, 'nos próximos 7 dias', ''], [m.teoria, 'para revisar teoria', m.teoria ? 'theory' : ''], [m.noMes, `revisões em ${MESES[Number(t.slice(5, 7)) - 1]}`, ''], [m.noPrazo == null ? '—' : m.noPrazo + '%', 'revisões feitas no prazo', ''], [m.dominioAlto, 'assuntos com domínio alto', 'good'], [m.total, 'assuntos cadastrados', '']];
+  h += `<div class="stat-strip section">${strip.map(([v, l, c]) => `<div class="stat ${c}"><b class="num">${v}</b><span>${l}</span></div>`).join('')}</div>`;
+  const fracasD = ds.filter(d => d.g.q >= 10 && nivelDePct(d.g.pct) <= 2).sort((a, b) => a.g.pct - b.g.pct);
+  h += `<section class="card section"><div class="section-head"><div><h2>Onde dar um gás</h2><p class="small muted">Assuntos com acerto baixo, em queda ou com revisão atrasada, em ordem de prioridade.</p></div><span class="count">${pri.length}</span></div>`;
+  h += pri.length ? `<div class="stack">${pri.slice(0, 8).map(prioRow).join('')}</div>` : `<div class="empty">Nenhum ponto de atenção agora. Continue registrando suas questões.</div>`;
+  if (fracasD.length) h += `<p class="small" style="margin-top:12px">Matérias abaixo de 70%: ${fracasD.map(d => `<button class="linkbtn" data-disc="${esc(d.nome)}">${esc(d.nome)} (${d.g.pct}%)</button>`).join(', ')}.</p>`;
+  h += `</section>`;
+  const ord = ds.slice().sort((a, b) => gasDisc(b) - gasDisc(a));
+  h += `<section class="section"><div class="section-head"><div><h2>Desempenho por matéria</h2><p class="small muted">Da que mais precisa de atenção para a mais forte. Toque para ver os detalhes.</p></div></div><div class="tablewrap"><table class="tbl-mat"><thead><tr><th>Matéria</th><th>Teoria vista</th><th>Questões</th><th>Acerto</th><th>Últimos 30 dias</th><th>Situação</th></tr></thead><tbody>${ord.map(d => `<tr class="row-click" data-disc="${esc(d.nome)}"><td><strong>${esc(d.nome)}</strong></td><td><div class="cov"><div class="bar"><i style="width:${d.cob}%"></i></div><span class="num small">${d.estudados}/${d.total}</span></div></td><td class="num">${d.g.q}</td><td class="num"><strong>${pctFmt(d.g.pct)}</strong></td><td class="small">${tendTxt(d.t)}</td><td>${chipSit(d.g)}</td></tr>`).join('')}</tbody></table></div></section>`;
+  const sem = serieSemanal(qh, 12);
+  h += `<div class="charts section"><div class="card chart-card"><h3>Evolução do acerto por semana</h3><p class="small muted" style="margin-bottom:8px">Acertos sobre questões de cada semana, nas últimas 12 semanas.</p>${lineChart(sem.map(w => ({ label: fmtBR(w.w), y: w.pct, tip: `semana de ${fmtBR(w.w)} · ${w.a}/${w.q} · ${pctFmt(w.pct)}` })), { id: 'tip-evo', empty: 'Ainda sem questões registradas.' })}<div class="tip" id="tip-evo"></div></div>`;
   h += `<div class="card chart-card"><h3>Revisões realizadas por semana</h3><p class="small muted" style="margin-bottom:8px">Últimas 10 semanas (semana começa na segunda).</p>${chartSemanas()}<div class="tip" id="tip-sem"></div></div>`;
-  h += `<div class="card"><h3>Distribuição por nível de domínio</h3><p class="small muted" style="margin-bottom:8px">Baseado no desempenho mais recente de cada assunto.</p>${chartDominio(m)}</div>`;
-  const teor = m.ag.filter(x => x.d.proximaAtividade === 'TEORIA').sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData));
-  h += `<div class="card"><h3>Precisam de revisão teórica</h3><p class="small muted" style="margin-bottom:8px">Acertos abaixo de ${cfg().limiteTeoria}% na última bateria.</p>${teor.length ? `<div class="stack">${teor.map(x => itemHTML(x, { showDate: true })).join('')}</div>` : '<div class="empty">Nenhum assunto precisa de revisão teórica agora.</div>'}</div></div>`;
+  h += `<div class="card"><h3>Distribuição por nível de domínio</h3><p class="small muted" style="margin-bottom:8px">Pelo resultado mais recente de cada assunto.</p>${chartDominio(m)}</div></div>`;
   view.innerHTML = h; bindItems(view); bindChartTips();
+  $$('[data-disc]', view).forEach(el => el.addEventListener('click', () => abrirMateria(el.dataset.disc)));
 }
-function chartEvolucao() {
-  const qh = state.history.filter(h => isQuestoes(h.tipo) && h.pct != null).sort((a, b) => a.dataRealizada.localeCompare(b.dataRealizada) || a.seq - b.seq).slice(-30);
-  if (!qh.length) return `<div class="chart-empty">Ainda sem revisões por questões registradas.</div>`;
-  const W = 600, H = 220, pl = 36, pr = 16, pt = 14, pb = 30, iw = W - pl - pr, ih = H - pt - pb; const n = qh.length;
-  const x = i => pl + (n === 1 ? iw / 2 : (i / (n - 1)) * iw); const y = v => pt + ih - (v / 100) * ih; const lim = cfg().limiteTeoria;
-  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Evolução da porcentagem de acertos">`;
-  [0, 25, 50, 75, 100].forEach(v => { s += `<line x1="${pl}" x2="${W - pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-width="1"/><text x="${pl - 6}" y="${y(v) + 4}" text-anchor="end" font-size="10" fill="var(--ink-3)">${v}%</text>`; });
-  s += `<line x1="${pl}" x2="${W - pr}" y1="${y(lim)}" y2="${y(lim)}" stroke="var(--orange)" stroke-width="1" stroke-dasharray="4 4"/><text x="${W - pr}" y="${y(lim) - 4}" text-anchor="end" font-size="10" fill="var(--orange)">limite teoria ${lim}%</text>`;
-  const pts = qh.map((h, i) => [x(i), y(h.pct)]);
-  if (n > 1) { s += `<path d="M${pts.map(p => p.join(',')).join(' L')} L${pts[n - 1][0]},${y(0)} L${pts[0][0]},${y(0)} Z" fill="var(--accent)" opacity=".10"/><path d="M${pts.map(p => p.join(',')).join(' L')}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>`; }
-  qh.forEach((h, i) => { s += `<circle cx="${pts[i][0]}" cy="${pts[i][1]}" r="${i === n - 1 ? 5 : 3.5}" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><circle cx="${pts[i][0]}" cy="${pts[i][1]}" r="12" fill="transparent" data-tip="${esc(h.assunto)} · ${fmtBR(h.dataRealizada)} · ${pctFmt(h.pct)}" data-tipfor="tip-evo"/>`; });
-  s += `<text x="${pts[n - 1][0]}" y="${pts[n - 1][1] - 10}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)">${pctFmt(qh[n - 1].pct)}</text>`;
-  (n <= 6 ? qh.map((_, i) => i) : [0, Math.floor((n - 1) / 2), n - 1]).forEach(i => { s += `<text x="${x(i)}" y="${H - 10}" text-anchor="middle" font-size="10" fill="var(--ink-3)">${fmtBR(qh[i].dataRealizada)}</text>`; });
+function prioRow(o) {
+  const { s, d } = o.x;
+  return `<div class="item ${statusCls(o.x)}" data-open="${s.id}"><div class="body"><div class="title"><span class="disc">${esc(s.disciplina)}</span><span>${esc(s.assunto)}</span></div><div class="meta">${o.motivos.map(t => `<span class="chip">${t}</span>`).join('')}${d.totQuestoes ? `<span class="num">${d.totAcertos}/${d.totQuestoes} no total</span>` : ''}</div></div><div class="act"><button class="primary sm" data-registrar="${s.id}">${acaoLabel(d.proximaAtividade)}</button></div></div>`;
+}
+function abrirMateria(nome) { state.ui.tab = 'materias'; state.ui.matView = 'materias'; state.ui.discSel = nome; state.ui.discCol = 'todos'; save(); render(); window.scrollTo({ top: 0 }); }
+// gráfico de linha 0–100% com linha do limite de teoria
+function lineChart(pts, { h = 200, id, empty = 'Sem dados ainda.' } = {}) {
+  const val = pts.map((p, i) => Object.assign({}, p, { i })).filter(p => p.y != null);
+  if (!val.length) return `<div class="chart-empty">${empty}</div>`;
+  const W = 600, H = h, pl = 38, pr = 16, pt = 18, pb = 28, iw = W - pl - pr, ih = H - pt - pb, n = pts.length, lim = cfg().limiteTeoria;
+  const x = i => pl + (n === 1 ? iw / 2 : (i / (n - 1)) * iw), y = v => pt + ih - (v / 100) * ih;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Evolução do acerto">`;
+  [0, 25, 50, 75, 100].forEach(v => { s += `<line x1="${pl}" x2="${W - pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)"/><text x="${pl - 6}" y="${y(v) + 4}" text-anchor="end" font-size="10" fill="var(--ink-3)">${v}%</text>`; });
+  s += `<line x1="${pl}" x2="${W - pr}" y1="${y(lim)}" y2="${y(lim)}" stroke="var(--orange)" stroke-dasharray="4 4"/><text x="${W - pr}" y="${y(lim) - 4}" text-anchor="end" font-size="10" fill="var(--orange)">limite teoria ${lim}%</text>`;
+  const P = val.map(p => [x(p.i), y(p.y)]);
+  if (P.length > 1) s += `<path d="M${P.map(q => q.join(',')).join(' L')} L${P[P.length - 1][0]},${y(0)} L${P[0][0]},${y(0)} Z" fill="var(--accent)" opacity=".10"/><path d="M${P.map(q => q.join(',')).join(' L')}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>`;
+  val.forEach((p, k) => { s += `<circle cx="${P[k][0]}" cy="${P[k][1]}" r="${k === val.length - 1 ? 5 : 3.5}" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>${id ? `<circle cx="${P[k][0]}" cy="${P[k][1]}" r="13" fill="transparent" data-tip="${esc(p.tip || '')}" data-tipfor="${id}"/>` : ''}`; });
+  const LP = P[P.length - 1]; s += `<text x="${Math.min(Math.max(LP[0], pl + 14), W - pr - 14)}" y="${Math.max(LP[1] - 10, 12)}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)">${pctFmt(val[val.length - 1].y)}</text>`;
+  (n <= 7 ? pts.map((_, i) => i) : [0, Math.round((n - 1) / 3), Math.round(2 * (n - 1) / 3), n - 1]).forEach(i => { s += `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" font-size="10" fill="var(--ink-3)">${esc(pts[i].label)}</text>`; });
   return s + `</svg>`;
+}
+function sparkline(serie) {
+  const v = serie.map((p, i) => ({ p, i })).filter(o => o.p != null); if (v.length < 2) return '<span class="spark"></span>';
+  const W = 100, H = 30, x = i => (i / (serie.length - 1)) * W, y = p => H - 3 - (p / 100) * (H - 6);
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><path d="M${v.map(o => `${x(o.i).toFixed(1)},${y(o.p).toFixed(1)}`).join(' L')}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>`;
 }
 function weekStart(iso) { const d = parseISO(iso); d.setDate(d.getDate() - (d.getDay() + 6) % 7); return toISO(d); }
 function chartSemanas() {
@@ -550,12 +758,57 @@ function chartDominio(m) {
   const counts = [0, 0, 0, 0, 0, 0]; m.all.forEach(x => counts[x.d.nivel.n]++); const max = Math.max(1, ...counts);
   return [5, 4, 3, 2, 1, 0].map(i => `<div class="hbar-row"><span>${NIVEIS[i].emoji} ${NIVEIS[i].nome}</span><div class="bar"><i style="width:${(counts[i] / max) * 100}%;background:var(${NIVEIS[i].var})"></i></div><span class="num" style="text-align:right;font-weight:700">${counts[i]}</span></div>`).join('');
 }
-function bindChartTips() {
-  $$('[data-tip]', view).forEach(el => { const tip = document.getElementById(el.dataset.tipfor); const card = el.closest('.chart-card'); const show = ev => { const r = card.getBoundingClientRect(); const p = ev.touches ? ev.touches[0] : ev; tip.textContent = el.dataset.tip; tip.style.display = 'block'; tip.style.left = (p.clientX - r.left) + 'px'; tip.style.top = (p.clientY - r.top) + 'px'; }; el.addEventListener('mousemove', show); el.addEventListener('mouseleave', () => tip.style.display = 'none'); el.addEventListener('touchstart', show, { passive: true }); el.addEventListener('touchend', () => setTimeout(() => tip.style.display = 'none', 1200)); });
+function bindChartTips(root = view) {
+  $$('[data-tip]', root).forEach(el => { const tip = document.getElementById(el.dataset.tipfor); const card = el.closest('.chart-card'); const show = ev => { const r = card.getBoundingClientRect(); const p = ev.touches ? ev.touches[0] : ev; tip.textContent = el.dataset.tip; tip.style.display = 'block'; tip.style.left = (p.clientX - r.left) + 'px'; tip.style.top = (p.clientY - r.top) + 'px'; }; el.addEventListener('mousemove', show); el.addEventListener('mouseleave', () => tip.style.display = 'none'); el.addEventListener('touchstart', show, { passive: true }); el.addEventListener('touchend', () => setTimeout(() => tip.style.display = 'none', 1200)); });
+}
+
+/* ===================== MATÉRIAS ===================== */
+const segMaterias = modo => `<div class="toolbar"><div class="segment"><button data-mv="materias" class="${modo === 'materias' ? 'active' : ''}">Por matéria</button><button data-mv="assuntos" class="${modo === 'assuntos' ? 'active' : ''}">Todos os assuntos</button></div></div>`;
+function bindMatSeg() { $$('[data-mv]', view).forEach(b => b.addEventListener('click', () => { state.ui.matView = b.dataset.mv; state.ui.discSel = null; save(); render(); })); }
+function renderMaterias(m) {
+  const modo = state.ui.matView || 'materias';
+  if (modo === 'assuntos') return renderAssuntos(m, segMaterias(modo));
+  if (state.ui.discSel) return renderDisciplina(m, state.ui.discSel);
+  const ds = statsDisciplinas(m.all); const qh = qReviews(); const G = agg(qh);
+  const est = m.all.filter(x => x.s.estudoRealizado).length; const cob = m.total ? Math.round(est / m.total * 100) : 0;
+  const ord = state.ui.matOrd || 'gas';
+  const sorters = { gas: (a, b) => gasDisc(b) - gasDisc(a), az: (a, b) => a.nome.localeCompare(b.nome, 'pt'), cob: (a, b) => a.cob - b.cob || a.nome.localeCompare(b.nome, 'pt'), acerto: (a, b) => (b.g.pct ?? -1) - (a.g.pct ?? -1) };
+  ds.sort(sorters[ord] || sorters.gas);
+  let h = segMaterias(modo);
+  h += `<section class="card section mat-resumo"><div><span class="eyebrow">Teoria vista</span><strong class="num">${est} de ${m.total}</strong><div class="progress sm"><i style="width:${cob}%"></i></div><span class="small muted">${cob}% do conteúdo · ${m.total - est} assuntos por estudar</span></div><div><span class="eyebrow">Questões</span><strong class="num">${G.q}</strong><span class="small muted">${G.a} acertos · ${G.e} erros</span></div><div><span class="eyebrow">Acerto geral</span><strong class="num">${pctFmt(G.pct)}</strong><span class="small">${tendTxt(tendencia(qh))}</span></div></section>`;
+  h += `<div class="toolbar"><label class="inline small" for="mat-ord">Ordenar por</label><select id="mat-ord" style="max-width:260px"><option value="gas" ${ord === 'gas' ? 'selected' : ''}>Precisa de mais atenção</option><option value="cob" ${ord === 'cob' ? 'selected' : ''}>Menos teoria vista</option><option value="acerto" ${ord === 'acerto' ? 'selected' : ''}>Maior acerto</option><option value="az" ${ord === 'az' ? 'selected' : ''}>A a Z</option></select></div>`;
+  h += `<div class="disc-grid">${ds.map(d => `<button class="disc-card" data-disc="${esc(d.nome)}"><div class="dc-head"><strong>${esc(d.nome)}</strong>${chipSit(d.g)}</div><div class="cov"><div class="bar"><i style="width:${d.cob}%"></i></div><span class="num small">${d.estudados}/${d.total} vistos</span></div><div class="dc-row">${d.g.q ? `<div><span class="dc-pct num">${pctFmt(d.g.pct)}</span> <span class="small muted">de acerto</span>${d.t.diff != null ? `<div class="small">${tendTxt(d.t)}</div>` : ''}</div>${sparkline(serieSemanal(d.hist, 8).map(w => w.pct))}` : '<span class="small muted">Nenhuma questão registrada ainda</span>'}</div><div class="small muted num">${d.g.q ? `${d.g.q} questões · ${d.g.e} erros` : `${d.total - d.estudados} por estudar`}${d.atrasadas ? ` · <span class="txt-red">${d.atrasadas} ${d.atrasadas === 1 ? 'atrasada' : 'atrasadas'}</span>` : ''}${d.fracos ? ` · ${d.fracos} ${d.fracos === 1 ? 'assunto fraco' : 'assuntos fracos'}` : ''}</div></button>`).join('')}</div>`;
+  view.innerHTML = h; bindMatSeg();
+  $('#mat-ord').addEventListener('change', e => { state.ui.matOrd = e.target.value; save(); render(); });
+  $$('[data-disc]', view).forEach(el => el.addEventListener('click', () => abrirMateria(el.dataset.disc)));
+}
+function renderDisciplina(m, nome) {
+  const D = statsDisciplinas(m.all).find(x => x.nome === nome); if (!D) { state.ui.discSel = null; save(); return renderMaterias(m); }
+  const filtro = state.ui.discCol || 'todos';
+  const pri = prioridades(D.itens).slice(0, 5);
+  const sem = serieSemanal(D.hist, 12);
+  const gas = x => (x.d.ultimoPct != null ? 100 - x.d.ultimoPct : 0) + (x.d.prazo === 'atrasada' ? 30 : 0) + (x.d.proximaData && x.d.proximaAtividade === 'TEORIA' ? 40 : 0);
+  const lista = D.itens.filter(x => filtro === 'todos' || x.d.coluna === filtro).sort((a, b) => (b.s.estudoRealizado - a.s.estudoRealizado) || gas(b) - gas(a) || (a.d.proximaData || '9999').localeCompare(b.d.proximaData || '9999') || a.s.numero - b.s.numero);
+  const kp = (v, l, c = '') => `<div class="kpi ${c}"><span class="v num">${v}</span><span class="l">${l}</span></div>`;
+  let h = segMaterias('materias');
+  h += `<div class="disc-top"><button class="ghost sm" id="disc-back">← Todas as matérias</button></div><div class="disc-title"><h2>${esc(nome)}</h2>${chipSit(D.g)}</div>`;
+  h += `<div class="kpis section">${kp(`${D.estudados}/${D.total}`, `teoria vista · ${D.cob}%`)}${kp(D.g.q, 'questões')}${kp(D.g.a, 'acertos', 'ok')}${kp(D.g.e, 'erros', 'err')}${kp(pctFmt(D.g.pct), 'acerto geral')}${kp(tendTxt(D.t), 'últimos 30 dias', 'kpi-txt')}</div>`;
+  h += `<div class="charts section"><div class="card chart-card"><h3>Evolução semanal</h3><p class="small muted" style="margin-bottom:8px">Acerto de cada semana nesta matéria.</p>${lineChart(sem.map(w => ({ label: fmtBR(w.w), y: w.pct, tip: `semana de ${fmtBR(w.w)} · ${w.a}/${w.q} · ${pctFmt(w.pct)}` })), { id: 'tip-disc', empty: 'O gráfico aparece quando você registrar questões desta matéria.' })}<div class="tip" id="tip-disc"></div></div>`;
+  h += `<div class="card"><h3>Onde dar um gás</h3>${pri.length ? `<div class="stack" style="margin-top:8px">${pri.map(prioRow).join('')}</div>` : '<p class="small muted" style="margin-top:6px">Nenhum assunto desta matéria precisa de atenção agora.</p>'}</div></div>`;
+  h += `<div class="toolbar"><div class="segment segment-scroll"><button data-dcol="todos" class="${filtro === 'todos' ? 'active' : ''}">Todos ${D.total}</button>${COLS.map(c => `<button data-dcol="${c.id}" class="${filtro === c.id ? 'active' : ''}">${c.nome} ${D.itens.filter(x => x.d.coluna === c.id).length}</button>`).join('')}</div></div>`;
+  h += lista.length ? `<div class="stack">${lista.map(srow).join('')}</div>` : '<div class="empty">Nenhum assunto nesta etapa.</div>';
+  view.innerHTML = h; bindMatSeg(); bindItems(view); bindChartTips();
+  $('#disc-back').addEventListener('click', () => { state.ui.discSel = null; save(); render(); window.scrollTo({ top: 0 }); });
+  $$('[data-dcol]', view).forEach(b => b.addEventListener('click', () => { state.ui.discCol = b.dataset.dcol; save(); render(); }));
+}
+function srow(x) {
+  const { s, d } = x; const chips = [`<span class="chip">${colNome(d.coluna)}</span>`];
+  if (d.proximaData && !s.concluido) chips.push(`<span class="chip ${d.prazo === 'atrasada' ? 's-atrasada' : d.prazo === 'hoje' ? 's-hoje' : ''}">${d.proximaAtividade === 'ESTUDO' ? 'estudar' : TIPOS[d.proximaAtividade].short.toLowerCase()} ${d.prazo === 'atrasada' ? `atrasada ${d.diasAtraso}d` : d.prazo === 'hoje' ? 'hoje' : fmtBR(d.proximaData)}</span>`);
+  return `<div class="srow ${statusCls(x)}" data-open="${s.id}"><div class="srow-main"><strong>${esc(s.assunto)}</strong><div class="kchips">${chips.join('')}</div></div><div class="srow-stats num">${d.totQuestoes ? `<b>${d.pctGeral}%</b><span class="small muted">${d.totAcertos}/${d.totQuestoes} · ${d.totErros} erros</span>` : '<span class="small muted">sem questões</span>'}${d.nivel.n ? `<span class="small">${NIVEIS[d.nivel.n].emoji}${d.nivel.tend > 0 ? ' ↗' : d.nivel.tend < 0 ? ' ↘' : ''}</span>` : ''}</div></div>`;
 }
 
 /* ===================== ASSUNTOS ===================== */
-function renderAssuntos(m) {
+function renderAssuntos(m, pre = '') {
   const f = state.ui.filtros || {}; const q = (f.q || '').toLowerCase();
   const discs = Array.from(new Set(cfg().disciplinas.concat(state.subjects.map(s => s.disciplina)))).sort();
   const list = m.all.filter(x => (!q || (x.s.assunto + ' ' + x.s.disciplina + ' ' + (x.s.obs || '')).toLowerCase().includes(q)) && (!f.disc || x.s.disciplina === f.disc) && (!f.status || x.d.status === f.status || (f.status === 'atrasada' && x.d.prazo === 'atrasada')));
@@ -570,7 +823,7 @@ function renderAssuntos(m) {
     list.forEach(x => { const { s, d } = x; h += `<tr class="row-click ${statusCls(x)}" data-open="${s.id}"><td class="num">#${s.numero}</td><td>${esc(s.disciplina)}</td><td class="wrap"><strong>${esc(s.assunto)}</strong></td><td class="num">${fmtBRFull(s.dataEstudo)}</td><td>${d.status}</td><td class="num">${d.ultimaRevisao ? fmtBRFull(d.ultimaRevisao) : '—'}</td><td>${d.ultimoTipo ? TIPOS[d.ultimoTipo].label : '—'}</td><td class="num">${d.numRevisoes}</td><td class="num">${d.ultimasQuestoes ?? '—'}</td><td class="num">${d.ultimosAcertos ?? '—'}</td><td class="num">${pctFmt(d.ultimoPct)}</td><td>${chipTipo(d.proximaAtividade)}</td><td class="num">${fmtBRFull(d.proximaData)} ${d.prazo === 'atrasada' ? '<span class="chip s-atrasada">ATRASADA</span>' : d.prazo === 'hoje' ? '<span class="chip s-hoje">HOJE</span>' : ''}</td><td class="num">${d.intervalo ? d.intervalo + ' d' : '—'}</td><td>${NIVEIS[d.nivel.n].emoji} ${NIVEIS[d.nivel.n].nome}${d.nivel.tend > 0 ? ' ↗' : d.nivel.tend < 0 ? ' ↘' : ''}</td><td class="wrap small muted">${esc(s.obs || '')}</td></tr>`; });
     h += `</tbody></table></div>`;
   }
-  view.innerHTML = h; bindItems(view);
+  view.innerHTML = pre + h; bindItems(view); bindMatSeg();
   const upd = () => { state.ui.filtros = { q: $('#f-q').value, disc: $('#f-disc').value, status: $('#f-status').value, sort: $('#f-sort').value }; save(); render(); if (state.ui._focusQ) { const i = $('#f-q'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); } };
   $('#f-q').addEventListener('input', () => { state.ui._focusQ = true; upd(); });
   ['#f-disc', '#f-status', '#f-sort'].forEach(id => $(id).addEventListener('change', () => { state.ui._focusQ = false; upd(); }));
@@ -602,7 +855,7 @@ function renderHistorico() {
 function renderConfig() {
   const c = cfg();
   const faixaRows = c.faixas.map((f, i) => { const next = c.faixas[i + 1]; const lbl = i === 0 ? `&lt;${c.limiteTeoria}%` : `${f.min}–${next ? next.min - 1 : 100}%`; return `<tr><td><strong>${lbl}</strong></td><td><input name="nome" value="${esc(f.nome)}" style="min-width:110px"></td><td>${i === 0 ? '<span class="muted">0</span>' : `<input type="number" name="min" min="1" max="100" value="${f.min}">`}</td><td><input type="number" name="intMin" min="0" value="${f.intMin}"></td><td><input type="number" name="intMax" min="0" value="${f.intMax}"></td><td><input type="number" name="padrao" min="0" value="${f.padrao}"></td><td><select name="conduta"><option value="QUESTOES" ${f.conduta === 'QUESTOES' ? 'selected' : ''}>Questões</option><option value="TEORIA" ${f.conduta === 'TEORIA' ? 'selected' : ''}>Revisar teoria</option></select></td></tr>`; }).join('');
-  const h = `<div class="card stack" style="margin-bottom:16px"><h2>Conta</h2><p class="small">Conectada como <strong>${esc(user.email || '')}</strong>. Os dados ficam no Supabase e aparecem em qualquer aparelho em que você entrar.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="sm" id="acc-sync">Sincronizar agora</button><button class="sm" id="acc-pass">Trocar senha</button><button class="sm" id="acc-out">Sair</button></div></div>
+  const h = `<div class="card stack" style="margin-bottom:16px"><h2>Conta</h2><p class="small">Conectada como <strong>${esc(user.email || '')}</strong>. Os dados ficam no Supabase e aparecem em qualquer aparelho em que você entrar.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="sm primary" id="acc-plano">Meu plano de estudos</button><button class="sm" id="acc-sync">Sincronizar agora</button><button class="sm" id="acc-pass">Trocar senha</button><button class="sm" id="acc-out">Sair</button></div></div>
   <form id="f-cfg" class="stack" style="gap:16px"><div class="card stack"><h2>Regras de revisão</h2><p class="small muted">O intervalo <strong>padrão</strong> é o usado automaticamente; mínimo e máximo servem de referência ao ajustar datas manualmente.</p><div class="tablewrap" style="border:0"><table class="cfg-table"><thead><tr><th>Desempenho</th><th>Nome</th><th>A partir de %</th><th>Int. mín (d)</th><th>Int. máx (d)</th><th>Padrão (d)</th><th>Conduta</th></tr></thead><tbody id="faixas">${faixaRows}</tbody></table></div>
     <div class="row3"><label>Limite p/ revisar teoria (%)<input type="number" id="c-limite" min="1" max="100" value="${c.limiteTeoria}"></label><label>1ª revisão: padrão (dias)<input type="number" id="c-pr-padrao" min="0" value="${c.primeiraRevisao.padrao}"></label><label>1ª revisão: máximo (dias)<input type="number" id="c-pr-max" min="0" value="${c.primeiraRevisao.max}"></label></div>
     <div class="row3"><label>Questões após teoria: padrão<input type="number" id="c-pt-padrao" min="0" value="${c.posTeoria.padrao}"></label><label>Questões após teoria: máximo<input type="number" id="c-pt-max" min="0" value="${c.posTeoria.max}"></label><label>Questões recomendadas<input type="number" id="c-quest" min="1" value="${c.questoesRecomendadas}"></label></div>
@@ -614,8 +867,10 @@ function renderConfig() {
     <details open><summary>Quando estudar um conteúdo novo</summary><ol><li>Toque em <strong>+ Novo assunto</strong>.</li><li>Preencha disciplina, assunto e a data em que estudou a teoria.</li><li>Pronto: a 1ª revisão por questões entra na agenda em ${c.primeiraRevisao.padrao} dia (ou 2, se você escolher).</li></ol></details>
     <details><summary>Quando fizer uma revisão</summary><ol><li>Abra a <strong>Agenda</strong>: o que é de hoje e o que está atrasado aparece no topo.</li><li>Toque em <strong>Registrar</strong> e informe questões feitas e acertos.</li><li>O app calcula a %, o nível de domínio, a próxima atividade e a data. Se ficou abaixo de ${c.limiteTeoria}%, ele agenda <strong>Revisar teoria</strong>; depois de marcar a teoria como feita, agenda questões em ${c.posTeoria.padrao} dia.</li></ol></details>
     <details><summary>Regras do algoritmo</summary><ul><li>&lt;${c.limiteTeoria}% → revisar teoria (mesmo dia a 48h), depois questões em 24–48h.</li><li>${c.faixas[1].min}–${c.faixas[2].min - 1}% → questões em ${c.faixas[1].intMin}–${c.faixas[1].intMax} dias.</li><li>${c.faixas[2].min}–${c.faixas[3].min - 1}% → ${c.faixas[2].intMin}–${c.faixas[2].intMax} dias.</li><li>${c.faixas[3].min}–${c.faixas[4].min - 1}% → ${c.faixas[3].intMin}–${c.faixas[3].intMax} dias.</li><li>≥${c.faixas[4].min}% → ${c.faixas[4].intMin}–${c.faixas[4].intMax} dias; mantendo ≥${c.faixas[4].min}% em sequência: ${c.manutencao.join(' → ')} dias.</li><li>Se a % cair, o intervalo cai junto na hora (ex.: 95% e depois 58% → 2 dias).</li><li>Atrasou? A revisão fica marcada como <strong>atrasada</strong> e continua na agenda até ser feita. A próxima data conta a partir do dia em que você realmente fez.</li></ul></details>
+    <details><summary>Plano de estudos e Kanban</summary><ul><li>Em <strong>Meu plano</strong> você informa a data da prova, quantos assuntos novos por dia e os dias de estudo. O app distribui o que falta estudar e as primeiras revisões pendentes, alternando as matérias.</li><li>Se atrasar, a agenda oferece <strong>Reorganizar</strong> a partir de hoje.</li><li>No <strong>Kanban</strong>, toda revisão marcada fica em Para revisar. Depois de feita e em dia, vai para Revisado, e volta quando chega a próxima data.</li><li>Em <strong>Matérias</strong> você vê cobertura, acerto e evolução de cada matéria, e onde precisa dar um gás.</li></ul></details>
     <details><summary>Instalar como app</summary><p class="small">No celular: abra no navegador e use "Adicionar à tela inicial" (Safari: botão compartilhar; Chrome: menu ⋮). No computador: ícone de instalar na barra de endereço.</p></details></div>`;
   view.innerHTML = h;
+  $('#acc-plano').addEventListener('click', modalPlano);
   $('#acc-sync').addEventListener('click', () => { toast('Sincronizando…'); syncNow(); });
   $('#acc-out').addEventListener('click', async () => { if (outbox.length && !confirm(`Há ${outbox.length} alterações ainda não enviadas. Sair mesmo assim?`)) return; await sb.auth.signOut(); });
   $('#acc-pass').addEventListener('click', () => modalSenha());
@@ -703,22 +958,43 @@ function modalRegistrar(id, aviso) {
   });
 }
 function modalAssunto(id) {
-  const s = findSubject(id); if (!s) return; const d = derive(s); const c = cfg(); const hist = d.hist.slice().reverse();
-  const f = d.last && isQuestoes(d.last.tipo) ? faixaFor(d.last.pct) : null;
-  const faixaTxt = f ? ` · faixa ${f.intMin}–${f.intMax} d` : d.ref === 'inicio' && s.estudoRealizado ? ` · até ${c.primeiraRevisao.max} d` : d.proximaAtividade === 'QUESTOES_POS_TEORIA' ? ` · até ${c.posTeoria.max} d` : '';
-  const html = `<div class="stack" style="gap:12px"><div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start"><div><span class="eyebrow">${esc(s.disciplina)} · #${s.numero}${s.exemplo ? ' · exemplo' : ''}</span><h2 style="font-size:1.2rem">${esc(s.assunto)}</h2></div>${chipNivel(d.nivel)}</div>
-    <div class="preview"><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${chipTipo(d.proximaAtividade)}${d.prazo === 'atrasada' ? `<span class="chip s-atrasada">ATRASADA · ${d.diasAtraso}d</span>` : d.prazo === 'hoje' ? '<span class="chip s-hoje">HOJE</span>' : ''}</div><b class="num">${d.proximaData ? fmtDiaLongo(d.proximaData) : s.concluido ? 'Concluído, fora da agenda' : 'Sem data na agenda'}</b><span class="small muted">Intervalo calculado: ${d.intervalo} ${d.intervalo === 1 ? 'dia' : 'dias'}${faixaTxt}${d.ajustada ? ' · data ajustada manualmente' : ''}</span><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px"><input type="date" id="a-data" value="${d.proximaData || todayISO()}" style="width:auto;min-height:36px;padding:4px 8px"><button class="sm" id="a-ajustar">${d.proximaData ? 'Ajustar data' : 'Agendar'}</button>${d.proximaData ? '<button class="sm" id="a-adiar">Adiar +1 dia</button>' : ''}</div></div>
-    <div class="kv small" style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px"><b class="muted">Status</b><span>${d.status}</span><b class="muted">Estudo inicial</b><span class="num">${fmtBRFull(s.dataEstudo)}${s.estudoRealizado ? '' : ' (ainda não realizado)'}</span><b class="muted">Última revisão</b><span class="num">${d.ultimaRevisao ? `${fmtBRFull(d.ultimaRevisao)} · ${TIPOS[d.ultimoTipo].label}` : '—'}</span><b class="muted">Último resultado</b><span class="num">${d.ultimoPct != null ? `${d.ultimosAcertos}/${d.ultimasQuestoes} · ${pctFmt(d.ultimoPct)}` : '—'}</span><b class="muted">Domínio</b><span>${nivelTexto(d.nivel)}</span>${s.obs ? `<b class="muted">Obs.</b><span>${esc(s.obs)}</span>` : ''}</div>
-    <div><span class="eyebrow">Histórico (${hist.length})</span>${hist.length ? `<div class="hist-list" style="margin-top:6px">${hist.map(h => `<div class="hist-row"><span class="num">${fmtBR(h.dataRealizada)}</span><span>${TIPOS[h.tipo].short}${h.pct != null ? ` · <strong class="num">${pctFmt(h.pct)}</strong> (${h.acertos}/${h.questoes})` : ''}${h.obs ? `<br><span class="muted">${esc(h.obs)}</span>` : ''}</span><span class="muted num">→ ${h.proximoIntervalo}d</span></div>`).join('')}</div>` : '<p class="small muted" style="margin-top:4px">Nenhuma revisão registrada.</p>'}</div>
-    <div class="actions"><div class="left"><button class="sm" id="a-editar">Editar</button>${hist.length ? '<button class="sm ghost danger" id="a-undo">Desfazer última</button>' : ''}</div><button data-close>Fechar</button><button class="primary" id="a-reg">${acaoLabel(d.proximaAtividade)}</button></div></div>`;
+  const s = findSubject(id); if (!s) return; const d = derive(s); const t = todayISO();
+  const qh = d.hist.filter(h => isQuestoes(h.tipo)); const melhor = qh.length ? Math.max(...qh.map(h => h.pct)) : null;
+  const D = statsDisciplinas(allDerived().filter(x => x.s.disciplina === s.disciplina))[0];
+  const pp = proximoPasso(s, d);
+  const kp = (v, l, c = '') => `<div class="kpi ${c}"><span class="v num">${v}</span><span class="l">${l}</span></div>`;
+  const eventos = d.hist.map(h => ({ data: h.dataRealizada, ord: h.seq, h }));
+  if (s.estudoRealizado && s.dataEstudo) eventos.push({ data: s.dataEstudo, ord: -1, estudo: true });
+  eventos.sort((a, b) => b.data.localeCompare(a.data) || b.ord - a.ord);
+  const tl = eventos.map(ev => {
+    if (ev.estudo) return `<li class="tl-item"><span class="tl-date num">${fmtBR(ev.data)}</span><div class="tl-body"><div class="tl-head"><span class="chip t-estudo">ESTUDO DA TEORIA</span></div></div></li>`;
+    const h = ev.h; const atraso = diffDays(h.dataProgramada, h.dataRealizada);
+    return `<li class="tl-item"><span class="tl-date num">${fmtBR(h.dataRealizada)}</span><div class="tl-body"><div class="tl-head">${chipTipo(h.tipo)}${h.pct != null ? `<strong class="num">${pctFmt(h.pct)}</strong><span class="num small muted">${h.acertos}/${h.questoes} · ${h.questoes - h.acertos} erros</span>` : ''}</div><div class="small muted">${atraso > 0 ? `feita com ${atraso} ${atraso === 1 ? 'dia' : 'dias'} de atraso · ` : ''}depois: ${TIPOS[h.proximaAtividade].short.toLowerCase()} em ${h.proximoIntervalo} ${h.proximoIntervalo === 1 ? 'dia' : 'dias'}</div>${h.obs ? `<div class="tl-obs">${esc(h.obs)}</div>` : ''}</div></li>`;
+  }).join('');
+  const estudoTxt = s.estudoRealizado && s.dataEstudo ? `estudado ${haDias(diffDays(s.dataEstudo, t))}` : s.estudoRealizado ? 'estudado (data não registrada)' : 'teoria ainda não estudada';
+  const html = `<div class="sd">
+    <header class="sd-head"><div><span class="eyebrow kdisc">${esc(s.disciplina)} · #${s.numero}${s.exemplo ? ' · exemplo' : ''}</span><h2>${esc(s.assunto)}</h2><div class="kchips"><span class="chip">${colNome(d.coluna)}</span>${chipNivel(d.nivel)}</div></div><button class="ghost sm sd-close" data-close aria-label="Fechar">✕</button></header>
+    <section class="next ${pp.cls}"><span class="eyebrow">Próximo passo</span><div class="next-title"><strong>${pp.titulo}</strong><span class="num">${pp.quando}</span></div><p class="small">${pp.porque}</p>
+      <div class="next-actions"><button class="primary" id="a-reg">${s.concluido ? 'Reativar' : acaoLabel(d.proximaAtividade)}</button>${s.concluido ? '' : `<div class="resched"><input type="date" id="a-data" value="${d.proximaData || t}" aria-label="Nova data"><button class="sm" id="a-ajustar">${d.proximaData ? 'Reagendar' : 'Agendar'}</button>${d.proximaData ? '<button class="sm" id="a-adiar">+1 dia</button>' : ''}</div>`}</div></section>
+    <section><h3>Desempenho</h3><div class="kpis">${kp(d.totQuestoes, 'questões')}${kp(d.totAcertos, 'acertos', 'ok')}${kp(d.totErros, 'erros', 'err')}${kp(d.pctGeral == null ? '—' : d.pctGeral + '%', 'acerto geral')}</div>
+      <p class="small muted sd-line">${d.numRevisoes} ${d.numRevisoes === 1 ? 'revisão' : 'revisões'} · última ${pctFmt(d.ultimoPct)} · melhor ${pctFmt(melhor)} · ${estudoTxt}${d.ultimaRevisao ? ` · última revisão ${haDias(diffDays(d.ultimaRevisao, t))}` : ''}</p></section>
+    <section class="chart-card"><h3>Evolução</h3>${lineChart(qh.map(h => ({ label: fmtBR(h.dataRealizada), y: h.pct, tip: `${fmtBR(h.dataRealizada)} · ${h.acertos}/${h.questoes} · ${pctFmt(h.pct)}` })), { h: 170, id: 'tip-subj', empty: 'O gráfico aparece depois da 1ª revisão por questões.' })}<div class="tip" id="tip-subj"></div></section>
+    ${D && D.g.q && d.pctGeral != null ? `<section><h3>Comparado com a matéria</h3><div class="cmp"><div class="cmp-row"><span>Este assunto</span><div class="bar"><i style="width:${d.pctGeral}%"></i></div><b class="num">${d.pctGeral}%</b></div><div class="cmp-row"><span>${esc(s.disciplina)}</span><div class="bar"><i class="alt" style="width:${D.g.pct}%"></i></div><b class="num">${D.g.pct}%</b></div></div></section>` : ''}
+    <section><h3>Linha do tempo</h3>${eventos.length ? `<ul class="timeline">${tl}</ul>` : '<p class="small muted">Nada registrado ainda.</p>'}</section>
+    <section><h3>Anotações</h3><textarea id="a-obs" placeholder="Pontos fracos, pegadinhas, o que errou, referências…">${esc(s.obs || '')}</textarea><span class="small muted" id="a-obs-st">Salvo automaticamente.</span></section>
+    <footer class="actions"><div class="left"><button class="sm" id="a-editar">Editar</button>${d.hist.length ? '<button class="sm ghost danger" id="a-undo">Desfazer última revisão</button>' : ''}</div>${s.concluido ? '' : '<button class="sm" id="a-concluir">Marcar como concluído</button>'}</footer></div>`;
   openModal(html, bg => {
-    $('#a-reg').addEventListener('click', () => modalRegistrar(id));
+    bindChartTips(bg);
+    $('#a-reg').addEventListener('click', () => { if (s.concluido) { s.concluido = false; dbUpsertSubject(s); save(); render(); toast('Assunto reativado'); return modalAssunto(id); } modalRegistrar(id); });
     $('#a-editar').addEventListener('click', () => modalNovoAssunto(s));
-    const undo = $('#a-undo', bg); if (undo) undo.addEventListener('click', () => { if (confirm('Desfazer a última revisão deste assunto?')) { desfazerUltima(id); toast('Revisão desfeita'); modalAssunto(id); render(); } });
-    const aplicar = iso => { if (!iso) return; ajustarData(id, iso); const dd = derive(s); let warn = ''; if (dd.ref === 'inicio' && s.estudoRealizado && s.dataEstudo && diffDays(s.dataEstudo, iso) > c.primeiraRevisao.max) warn = ` · atenção: passou de ${c.primeiraRevisao.max * 24}h do estudo`; else if (f && diffDays(d.last.dataRealizada, iso) > f.intMax) warn = ` · atenção: acima do máximo da faixa (${f.intMax}d)`; toast(`Próxima data: ${fmtBR(iso)}${warn}`); modalAssunto(id); render(); };
-    $('#a-ajustar').addEventListener('click', () => aplicar($('#a-data').value));
-    const adiar = $('#a-adiar', bg); if (adiar) adiar.addEventListener('click', () => aplicar(addDays(d.proximaData, 1)));
-  });
+    const undo = $('#a-undo', bg); if (undo) undo.addEventListener('click', () => { if (confirm('Desfazer a última revisão deste assunto?')) { desfazerUltima(id); toast('Revisão desfeita'); render(); modalAssunto(id); } });
+    const conc = $('#a-concluir', bg); if (conc) conc.addEventListener('click', () => { moveTo(id, 'concluido'); if (findSubject(id) && findSubject(id).concluido) modalAssunto(id); });
+    const aplicar = iso => { if (!iso) return; ajustarData(id, iso); render(); toast(`Próxima data: ${iso === t ? 'hoje' : fmtBR(iso)}`); modalAssunto(id); };
+    const aj = $('#a-ajustar', bg); if (aj) aj.addEventListener('click', () => aplicar($('#a-data').value));
+    const ad = $('#a-adiar', bg); if (ad) ad.addEventListener('click', () => aplicar(addDays(d.proximaData, 1)));
+    const obs = $('#a-obs'); let tm;
+    obs.addEventListener('input', () => { $('#a-obs-st').textContent = 'Salvando…'; clearTimeout(tm); tm = setTimeout(() => { s.obs = obs.value.trim(); dbUpsertSubject(s); save(); $('#a-obs-st').textContent = 'Salvo.'; }, 700); });
+  }, { size: 'lg' });
 }
 function modalSenha() {
   openModal(`<form id="f-senha" class="stack" style="gap:12px"><h2>Trocar senha</h2><label>Nova senha<input type="password" name="p1" minlength="6" required autocomplete="new-password"></label><label>Repita a nova senha<input type="password" name="p2" minlength="6" required autocomplete="new-password"></label><div class="actions"><button type="button" data-close>Cancelar</button><button class="primary" type="submit">Salvar senha</button></div></form>`, () => {

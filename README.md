@@ -55,11 +55,23 @@ Cinco colunas, sempre sincronizadas com a agenda: o que muda em um aparece no ou
 
 | Coluna | O que significa | Ao arrastar um card para ela |
 |---|---|---|
-| Assuntos | ainda não estudado | volta a "a estudar" e sai da agenda (só se não tiver revisões) |
-| Estudado | teoria vista, 1ª revisão ainda no futuro ou não agendada | registra o estudo (se vier de Assuntos) ou tira a revisão da agenda |
-| Para revisar | revisão de hoje, atrasada ou revisão teórica pendente | agenda a revisão para hoje |
-| Revisado | já revisado, próxima revisão agendada | abre o registro de questões e acertos |
+| Assuntos | teoria ainda não estudada (com ou sem data no plano) | volta a "a estudar" e sai da agenda (só se não tiver revisões) |
+| Estudado | teoria vista, sem revisão marcada | registra o estudo (se vier de Assuntos) ou tira a revisão da agenda |
+| Para revisar | revisão marcada e pendente: 1ª revisão, de hoje, atrasada ou de teoria | escolhe a data da 1ª revisão, ou antecipa para hoje |
+| Revisado | revisão feita e em dia; volta para Para revisar na próxima data | abre o registro de questões e acertos |
 | Concluído | manutenção (≥ 90 % repetido) ou marcado como concluído | tira da agenda (reativa ao mover para outra coluna) |
+
+## Plano de estudos (Agenda → Meu plano)
+
+Data da prova, assuntos novos por dia, primeiras revisões pendentes por dia e dias da semana de estudo. O app distribui o que falta estudar e as revisões sem data, alternando as matérias, e avisa se o ritmo não termina a teoria 30 dias antes da prova. Se atrasar, a agenda oferece **Reorganizar** a partir de hoje.
+
+A tela **Hoje** mostra o plano do dia com progresso: revisar teoria, questões (de hoje e atrasadas) e estudos novos.
+
+## Matérias e Painel
+
+- **Matérias**: cada matéria com teoria vista, acerto, tendência dos últimos 30 dias e evolução semanal. Tocar abre a matéria com seus assuntos por etapa e o que precisa de atenção.
+- **Painel**: cobertura da teoria, acerto geral, questões, dias seguidos estudando, "Onde dar um gás" e desempenho por matéria.
+- **Ficha do assunto**: próximo passo com o motivo, questões/acertos/erros, evolução, comparação com a matéria, linha do tempo e anotações.
 
 Cada card mostra o histórico do assunto: questões feitas, acertos, erros e % geral, número de revisões e último resultado. No celular, use o botão ⋯ do card para mover.
 
