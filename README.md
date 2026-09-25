@@ -49,6 +49,22 @@ Arquivos estáticos; qualquer hospedagem com **https** serve.
 
 No celular: "Adicionar à tela inicial" (Safari: compartilhar; Chrome: menu ⋮ → Instalar app).
 
+## Kanban (Agenda → Kanban)
+
+Cinco colunas, sempre sincronizadas com a agenda: o que muda em um aparece no outro.
+
+| Coluna | O que significa | Ao arrastar um card para ela |
+|---|---|---|
+| Assuntos | ainda não estudado | volta a "a estudar" e sai da agenda (só se não tiver revisões) |
+| Estudado | teoria vista, 1ª revisão ainda no futuro ou não agendada | registra o estudo (se vier de Assuntos) ou tira a revisão da agenda |
+| Para revisar | revisão de hoje, atrasada ou revisão teórica pendente | agenda a revisão para hoje |
+| Revisado | já revisado, próxima revisão agendada | abre o registro de questões e acertos |
+| Concluído | manutenção (≥ 90 % repetido) ou marcado como concluído | tira da agenda (reativa ao mover para outra coluna) |
+
+Cada card mostra o histórico do assunto: questões feitas, acertos, erros e % geral, número de revisões e último resultado. No celular, use o botão ⋯ do card para mover.
+
+A lista inicial de assuntos fica em `assuntos-iniciais.js` e é importada automaticamente na primeira entrada de uma conta nova (Config → "Importar lista de assuntos" importa de novo, pulando os que já existem). Os assuntos marcados como "já vi" entram em **Estudado** sem data. O botão **Agendar revisões** da coluna distribui as primeiras revisões ao longo dos dias, alternando as disciplinas.
+
 ## Como usar no dia a dia
 
 **Estudou um assunto novo:** `+ Novo assunto` → disciplina, assunto, data do estudo. A 1ª revisão por questões entra na agenda para o dia seguinte (ou +2 dias; nunca depois de 48 h).

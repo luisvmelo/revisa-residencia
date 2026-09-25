@@ -88,8 +88,8 @@ function save(now) {
 const cfg = () => state.config;
 
 /* ---------- mapeamento app <-> banco ---------- */
-const subjectToRow = s => ({ id: s.id, user_id: user.id, numero: s.numero, disciplina: s.disciplina, assunto: s.assunto, data_estudo: s.dataEstudo, estudo_realizado: !!s.estudoRealizado, primeira_revisao_dias: s.primeiraRevisaoDias ?? 1, obs: s.obs || '', ajuste: s.ajuste || null, exemplo: !!s.exemplo, criado_em: s.criadoEm || todayISO() });
-const rowToSubject = r => ({ id: r.id, numero: r.numero, disciplina: r.disciplina, assunto: r.assunto, dataEstudo: r.data_estudo, estudoRealizado: r.estudo_realizado, primeiraRevisaoDias: r.primeira_revisao_dias, obs: r.obs || '', ajuste: r.ajuste || null, exemplo: !!r.exemplo, criadoEm: r.criado_em });
+const subjectToRow = s => ({ id: s.id, user_id: user.id, numero: s.numero, disciplina: s.disciplina, assunto: s.assunto, data_estudo: s.dataEstudo || null, estudo_realizado: !!s.estudoRealizado, primeira_revisao_dias: s.primeiraRevisaoDias ?? 1, obs: s.obs || '', ajuste: s.ajuste || null, exemplo: !!s.exemplo, concluido: !!s.concluido, criado_em: s.criadoEm || todayISO() });
+const rowToSubject = r => ({ id: r.id, numero: r.numero, disciplina: r.disciplina, assunto: r.assunto, dataEstudo: r.data_estudo, estudoRealizado: r.estudo_realizado, primeiraRevisaoDias: r.primeira_revisao_dias, obs: r.obs || '', ajuste: r.ajuste || null, exemplo: !!r.exemplo, concluido: !!r.concluido, criadoEm: r.criado_em });
 const reviewToRow = h => ({ id: h.id, user_id: user.id, subject_id: h.subjectId, seq: h.seq, numero: h.numero, data_programada: h.dataProgramada, data_realizada: h.dataRealizada, tipo: h.tipo, questoes: h.questoes ?? null, acertos: h.acertos ?? null, pct: h.pct ?? null, intervalo_anterior: h.intervaloAnterior ?? null, proximo_intervalo: h.proximoIntervalo, proxima_atividade: h.proximaAtividade, proxima_data: h.proximaData, streak: h.streak || 0, faixa: h.faixa || null, obs: h.obs || '', exemplo: !!h.exemplo });
 const rowToReview = (r, sm) => { const s = sm[r.subject_id]; return { id: r.id, subjectId: r.subject_id, disciplina: s ? s.disciplina : '', assunto: s ? s.assunto : '', seq: r.seq, numero: r.numero, dataProgramada: r.data_programada, dataRealizada: r.data_realizada, tipo: r.tipo, questoes: r.questoes, acertos: r.acertos, pct: r.pct == null ? null : Number(r.pct), intervaloAnterior: r.intervalo_anterior, proximoIntervalo: r.proximo_intervalo, proximaAtividade: r.proxima_atividade, proximaData: r.proxima_data, streak: r.streak || 0, faixa: r.faixa, obs: r.obs || '', exemplo: !!r.exemplo }; };
 
@@ -99,6 +99,7 @@ function loadOutbox() { try { outbox = JSON.parse(localStorage.getItem(outboxKey
 function saveOutbox() { try { localStorage.setItem(outboxKey(), JSON.stringify(outbox)); } catch (e) { /* ignore */ } }
 function enqueue(op) { outbox.push(op); saveOutbox(); setSync(); flushOutbox(); }
 const dbUpsertSubject = s => enqueue({ table: 'subjects', op: 'upsert', row: subjectToRow(s) });
+const dbUpsertSubjects = list => { for (let i = 0; i < list.length; i += 200) enqueue({ table: 'subjects', op: 'upsert', row: list.slice(i, i + 200).map(subjectToRow) }); };
 const dbUpsertReview = h => enqueue({ table: 'reviews', op: 'upsert', row: reviewToRow(h) });
 const dbDelete = (table, match) => enqueue({ table, op: 'delete', match });
 const dbSaveConfig = () => enqueue({ table: 'settings', op: 'upsert', row: { user_id: user.id, config: state.config } });
@@ -151,7 +152,9 @@ async function pullAll() {
   state.nextSeq = state.history.reduce((m, h) => Math.max(m, h.seq), 0) + 1;
   if (rc.data && rc.data.config) state.config = Object.assign(defaultConfig(), rc.data.config);
   else dbSaveConfig();
-  state.loaded = true; save(true); setSync('ok'); render();
+  state.loaded = true;
+  if (!state.config.listaImportada && (window.REVISA_ASSUNTOS || []).length) { const n = importarLista(); if (n) toast(`${n} assuntos da sua lista foram adicionados ao Kanban`); }
+  save(true); setSync('ok'); render();
 }
 async function syncNow() { const ok = await flushOutbox(); if (ok) await pullAll(); }
 
@@ -186,24 +189,30 @@ function derive(s) {
   const c = cfg(); const hist = subjectHistory(s.id); const last = hist[hist.length - 1]; const qh = hist.filter(h => isQuestoes(h.tipo));
   const d = { hist, last, numRevisoes: hist.length, numQuestoes: qh.length };
   if (!last) {
-    if (!s.estudoRealizado) { d.proximaAtividade = 'ESTUDO'; d.proximaData = s.dataEstudo; d.intervalo = 0; }
-    else { d.intervalo = s.primeiraRevisaoDias ?? c.primeiraRevisao.padrao; d.proximaAtividade = 'QUESTOES'; d.proximaData = addDays(s.dataEstudo, d.intervalo); }
+    if (!s.estudoRealizado) { d.proximaAtividade = 'ESTUDO'; d.proximaData = s.dataEstudo || null; d.intervalo = 0; }
+    else { d.intervalo = s.primeiraRevisaoDias ?? c.primeiraRevisao.padrao; d.proximaAtividade = 'QUESTOES'; d.proximaData = s.dataEstudo ? addDays(s.dataEstudo, d.intervalo) : null; }
     d.streak = 0; d.ref = 'inicio'; d.ultimaRevisao = null; d.ultimoTipo = null;
   } else { d.proximaAtividade = last.proximaAtividade; d.proximaData = last.proximaData; d.intervalo = last.proximoIntervalo; d.streak = last.streak || 0; d.ref = last.id; d.ultimaRevisao = last.dataRealizada; d.ultimoTipo = last.tipo; }
-  if (s.ajuste && s.ajuste.ref === d.ref && s.ajuste.data) { d.proximaData = s.ajuste.data; d.ajustada = true; }
+  if (s.ajuste && s.ajuste.ref === d.ref) { if (s.ajuste.semAgenda) d.proximaData = null; else if (s.ajuste.data) { d.proximaData = s.ajuste.data; d.ajustada = true; } }
+  if (s.concluido) { d.proximaData = null; d.ajustada = false; }
   const lastQ = qh[qh.length - 1];
   d.ultimoPct = lastQ ? lastQ.pct : null; d.ultimasQuestoes = lastQ ? lastQ.questoes : null; d.ultimosAcertos = lastQ ? lastQ.acertos : null;
+  d.totQuestoes = qh.reduce((a, h) => a + (Number(h.questoes) || 0), 0); d.totAcertos = qh.reduce((a, h) => a + (Number(h.acertos) || 0), 0);
+  d.totErros = d.totQuestoes - d.totAcertos; d.pctGeral = d.totQuestoes ? Math.round(d.totAcertos / d.totQuestoes * 100) : null;
   d.nivel = nivelDominio(qh, c);
-  d.status = d.proximaAtividade === 'ESTUDO' ? 'Planejado' : d.proximaAtividade === 'TEORIA' ? 'Revisar teoria' : d.proximaAtividade === 'MANUTENCAO' ? 'Manutenção' : 'Em revisão';
-  d.prazo = prazo(d.proximaData); d.diasAtraso = d.prazo === 'atrasada' ? diffDays(d.proximaData, todayISO()) : 0;
+  d.status = s.concluido ? 'Concluído' : !s.estudoRealizado ? 'A estudar' : !d.proximaData ? 'Estudado' : d.proximaAtividade === 'TEORIA' ? 'Revisar teoria' : d.proximaAtividade === 'MANUTENCAO' ? 'Manutenção' : 'Em revisão';
+  d.prazo = d.proximaData ? prazo(d.proximaData) : 'sem'; d.diasAtraso = d.prazo === 'atrasada' ? diffDays(d.proximaData, todayISO()) : 0;
+  d.coluna = s.concluido ? 'concluido' : !s.estudoRealizado ? 'assuntos' : !d.proximaData ? 'estudado'
+    : (d.proximaAtividade === 'TEORIA' || d.prazo !== 'futura') ? 'revisar' : d.proximaAtividade === 'MANUTENCAO' ? 'concluido' : d.numRevisoes === 0 ? 'estudado' : 'revisado';
   return d;
 }
 const allDerived = () => state.subjects.map(s => ({ s, d: derive(s) }));
+const agendados = all => all.filter(x => x.d.proximaData);
 const findSubject = id => state.subjects.find(s => s.id === id);
 
 /* ===================== ações (memória + banco) ===================== */
 function addSubject({ disciplina, assunto, dataEstudo, estudoRealizado, primeiraRevisaoDias, obs, exemplo }) {
-  const s = { id: uuid(), numero: state.nextNumero++, disciplina: disciplina.trim(), assunto: assunto.trim(), dataEstudo, estudoRealizado: !!estudoRealizado, primeiraRevisaoDias, obs: (obs || '').trim(), criadoEm: todayISO(), ajuste: null, exemplo: !!exemplo };
+  const s = { id: uuid(), numero: state.nextNumero++, disciplina: disciplina.trim(), assunto: assunto.trim(), dataEstudo: dataEstudo || null, estudoRealizado: !!estudoRealizado, primeiraRevisaoDias, obs: (obs || '').trim(), criadoEm: todayISO(), ajuste: null, exemplo: !!exemplo };
   state.subjects.push(s); dbUpsertSubject(s);
   if (s.disciplina && !cfg().disciplinas.includes(s.disciplina)) { cfg().disciplinas.push(s.disciplina); dbSaveConfig(); }
   save(); return s;
@@ -212,13 +221,13 @@ function updateSubject(s, patch) { Object.assign(s, patch); state.history.forEac
 function registrar(subjectId, { dataRealizada, questoes, acertos, obs }) {
   const s = findSubject(subjectId); if (!s) return null;
   const d = derive(s); const tipo = d.proximaAtividade;
-  if (tipo === 'ESTUDO') { s.estudoRealizado = true; s.dataEstudo = dataRealizada; s.ajuste = null; dbUpsertSubject(s); save(); return { estudo: true }; }
+  if (tipo === 'ESTUDO') { s.estudoRealizado = true; s.dataEstudo = dataRealizada; s.ajuste = null; s.concluido = false; dbUpsertSubject(s); save(); return { estudo: true }; }
   let pct = null;
   if (isQuestoes(tipo)) { questoes = Number(questoes); acertos = Number(acertos); pct = questoes > 0 ? Math.round((acertos / questoes) * 1000) / 10 : 0; }
   const plan = planAfter({ tipo, pct, streakAnterior: d.streak });
-  const entry = { id: uuid(), seq: state.nextSeq++, subjectId, disciplina: s.disciplina, assunto: s.assunto, numero: d.numRevisoes + 1, dataProgramada: d.proximaData, dataRealizada, tipo, questoes: isQuestoes(tipo) ? questoes : null, acertos: isQuestoes(tipo) ? acertos : null, pct, intervaloAnterior: d.intervalo, proximoIntervalo: plan.intervalo, proximaAtividade: plan.proximaAtividade, proximaData: addDays(dataRealizada, plan.intervalo), streak: plan.streak, faixa: plan.faixa ? plan.faixa.nome : null, obs: (obs || '').trim(), exemplo: !!s.exemplo };
+  const entry = { id: uuid(), seq: state.nextSeq++, subjectId, disciplina: s.disciplina, assunto: s.assunto, numero: d.numRevisoes + 1, dataProgramada: d.proximaData || dataRealizada, dataRealizada, tipo, questoes: isQuestoes(tipo) ? questoes : null, acertos: isQuestoes(tipo) ? acertos : null, pct, intervaloAnterior: d.intervalo, proximoIntervalo: plan.intervalo, proximaAtividade: plan.proximaAtividade, proximaData: addDays(dataRealizada, plan.intervalo), streak: plan.streak, faixa: plan.faixa ? plan.faixa.nome : null, obs: (obs || '').trim(), exemplo: !!s.exemplo };
   state.history.push(entry); dbUpsertReview(entry);
-  if (s.ajuste) { s.ajuste = null; dbUpsertSubject(s); }
+  if (s.ajuste || s.concluido) { s.ajuste = null; s.concluido = false; dbUpsertSubject(s); }
   save(); return entry;
 }
 function desfazerUltima(subjectId) {
@@ -227,7 +236,14 @@ function desfazerUltima(subjectId) {
   const s = findSubject(subjectId); if (s && s.ajuste) { s.ajuste = null; dbUpsertSubject(s); }
   save(); return true;
 }
-function ajustarData(subjectId, iso) { const s = findSubject(subjectId); const d = derive(s); s.ajuste = { ref: d.ref, data: iso }; dbUpsertSubject(s); save(); }
+function ajustarData(subjectId, iso) { const s = findSubject(subjectId); s.concluido = false; const d = derive(s); s.ajuste = { ref: d.ref, data: iso }; dbUpsertSubject(s); save(); }
+const normNome = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+function importarLista() {
+  const L = window.REVISA_ASSUNTOS || []; const existentes = new Set(state.subjects.map(s => normNome(s.assunto))); const novos = [];
+  L.forEach(it => { if (existentes.has(normNome(it.a))) return; const s = { id: uuid(), numero: state.nextNumero++, disciplina: it.d, assunto: it.a, dataEstudo: null, estudoRealizado: !!it.v, primeiraRevisaoDias: cfg().primeiraRevisao.padrao, obs: '', criadoEm: todayISO(), ajuste: null, exemplo: false, concluido: false }; state.subjects.push(s); novos.push(s); });
+  L.forEach(it => { if (!cfg().disciplinas.includes(it.d)) cfg().disciplinas.push(it.d); });
+  cfg().listaImportada = true; dbSaveConfig(); dbUpsertSubjects(novos); save(true); return novos.length;
+}
 function removeSubject(id) { state.subjects = state.subjects.filter(s => s.id !== id); state.history = state.history.filter(h => h.subjectId !== id); dbDelete('subjects', { id }); save(); }
 function replaceAll(data) {
   // substitui tudo (importação de backup)
@@ -238,7 +254,7 @@ function replaceAll(data) {
 }
 function normalizeImport(raw) {
   // aceita backups antigos (ids numéricos) e novos (uuid)
-  const idMap = {}; const subjects = (raw.subjects || []).map((s, i) => { const nid = typeof s.id === 'string' && s.id.includes('-') ? s.id : uuid(); idMap[s.id] = nid; return { id: nid, numero: s.numero || (typeof s.id === 'number' ? s.id : i + 1), disciplina: s.disciplina, assunto: s.assunto, dataEstudo: s.dataEstudo, estudoRealizado: s.estudoRealizado !== false, primeiraRevisaoDias: s.primeiraRevisaoDias ?? 1, obs: s.obs || '', ajuste: s.ajuste || null, exemplo: !!s.exemplo, criadoEm: s.criadoEm || todayISO() }; });
+  const idMap = {}; const subjects = (raw.subjects || []).map((s, i) => { const nid = typeof s.id === 'string' && s.id.includes('-') ? s.id : uuid(); idMap[s.id] = nid; return { id: nid, numero: s.numero || (typeof s.id === 'number' ? s.id : i + 1), disciplina: s.disciplina, assunto: s.assunto, dataEstudo: s.dataEstudo || null, estudoRealizado: s.estudoRealizado !== false, primeiraRevisaoDias: s.primeiraRevisaoDias ?? 1, obs: s.obs || '', ajuste: s.ajuste || null, exemplo: !!s.exemplo, concluido: !!s.concluido, criadoEm: s.criadoEm || todayISO() }; });
   const seen = new Set(); subjects.forEach(s => { while (seen.has(s.numero)) s.numero++; seen.add(s.numero); });
   const history = (raw.history || []).filter(h => idMap[h.subjectId]).map((h, i) => ({ ...h, id: typeof h.id === 'string' && h.id.includes('-') ? h.id : uuid(), subjectId: idMap[h.subjectId], seq: h.seq || i + 1, pct: h.pct == null ? null : Number(h.pct) }));
   return { config: raw.config, subjects, history };
@@ -246,14 +262,14 @@ function normalizeImport(raw) {
 
 /* ===================== métricas ===================== */
 function metrics() {
-  const t = todayISO(); const t7 = addDays(t, 7); const mes = t.slice(0, 7); const all = allDerived();
-  const hoje = all.filter(x => x.d.prazo === 'hoje').length; const atrasadas = all.filter(x => x.d.prazo === 'atrasada').length;
-  const prox7 = all.filter(x => x.d.proximaData > t && x.d.proximaData <= t7).length; const teoria = all.filter(x => x.d.proximaAtividade === 'TEORIA').length;
+  const t = todayISO(); const t7 = addDays(t, 7); const mes = t.slice(0, 7); const all = allDerived(); const ag = agendados(all);
+  const hoje = ag.filter(x => x.d.prazo === 'hoje').length; const atrasadas = ag.filter(x => x.d.prazo === 'atrasada').length;
+  const prox7 = ag.filter(x => x.d.proximaData > t && x.d.proximaData <= t7).length; const teoria = ag.filter(x => x.d.proximaAtividade === 'TEORIA').length;
   const dominioAlto = all.filter(x => x.d.nivel.n >= 4).length;
   const qh = state.history.filter(h => isQuestoes(h.tipo) && h.pct != null); const media = qh.length ? qh.reduce((a, h) => a + h.pct, 0) / qh.length : null;
   const noMes = state.history.filter(h => h.dataRealizada.slice(0, 7) === mes).length;
   const noPrazo = state.history.length ? Math.round(state.history.filter(h => h.dataRealizada <= h.dataProgramada).length / state.history.length * 100) : null;
-  return { hoje, atrasadas, prox7, teoria, dominioAlto, media, noMes, noPrazo, total: state.subjects.length, all };
+  return { hoje, atrasadas, prox7, teoria, dominioAlto, media, noMes, noPrazo, total: state.subjects.length, all, ag };
 }
 
 /* ===================== UI: infra ===================== */
@@ -285,6 +301,7 @@ function render() {
   if (!user) return;
   const tab = state.ui.tab || 'agenda';
   $$('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  $('.content').classList.toggle('wide', tab === 'agenda' && state.ui.agendaMode === 'kanban');
   const m = metrics(); const badge = m.atrasadas + m.hoje;
   const tabA = $('#tab-agenda'); let bd = $('.badge', tabA); if (badge > 0) { if (!bd) { bd = document.createElement('span'); bd.className = 'badge'; tabA.appendChild(bd); } bd.textContent = badge; } else if (bd) bd.remove();
   $('#topbar-date').textContent = fmtDiaLongo(todayISO());
@@ -308,18 +325,20 @@ function itemHTML(x, opts = {}) {
 }
 function renderAgenda(m) {
   const mode = state.ui.agendaMode || 'lista';
-  let html = `<div class="toolbar"><div class="segment"><button data-mode="lista" class="${mode === 'lista' ? 'active' : ''}">Hoje e próximos</button><button data-mode="mes" class="${mode === 'mes' ? 'active' : ''}">Mês</button></div></div>`;
-  html += mode === 'lista' ? agendaLista(m) : agendaMes(m);
+  let html = `<div class="toolbar"><div class="segment"><button data-mode="lista" class="${mode === 'lista' ? 'active' : ''}">Hoje e próximos</button><button data-mode="mes" class="${mode === 'mes' ? 'active' : ''}">Mês</button><button data-mode="kanban" class="${mode === 'kanban' ? 'active' : ''}">Kanban</button></div></div>`;
+  html += mode === 'lista' ? agendaLista(m) : mode === 'mes' ? agendaMes(m) : agendaKanban(m);
   view.innerHTML = html;
   $$('[data-mode]', view).forEach(b => b.addEventListener('click', () => { state.ui.agendaMode = b.dataset.mode; save(); render(); }));
-  bindItems(view); if (mode === 'mes') bindMes();
+  bindItems(view); if (mode === 'mes') bindMes(); if (mode === 'kanban') bindKanban();
 }
 function agendaLista(m) {
   const t = todayISO();
-  const all = m.all.slice().sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData) || a.s.disciplina.localeCompare(b.s.disciplina));
+  const all = m.ag.slice().sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData) || a.s.disciplina.localeCompare(b.s.disciplina));
   const atras = all.filter(x => x.d.prazo === 'atrasada'); const hoje = all.filter(x => x.d.prazo === 'hoje'); const prox = all.filter(x => x.d.proximaData > t && x.d.proximaData <= addDays(t, 7));
   let h = `<div class="summary"><span class="pill s-atrasada">${atras.length} atrasada${atras.length === 1 ? '' : 's'}</span><span class="pill s-hoje">${hoje.length} hoje</span><span class="pill">${prox.length} nos próximos 7 dias</span>${m.teoria ? `<span class="pill s-teoria">${m.teoria} p/ revisar teoria</span>` : ''}</div>`;
   if (!state.subjects.length) { h += `<div class="empty"><p><strong>Nenhum assunto cadastrado ainda.</strong></p><p style="margin-top:6px">Cadastre o primeiro assunto estudado e a primeira revisão será programada automaticamente.</p><div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap"><button class="primary" id="empty-novo">+ Novo assunto</button><button id="empty-exemplo">Carregar exemplos</button></div></div>`; return h; }
+  const semAgenda = m.all.filter(x => x.d.coluna === 'estudado' && !x.d.proximaData).length;
+  if (semAgenda) h += `<div class="hint"><span><strong>${semAgenda}</strong> ${semAgenda === 1 ? 'assunto estudado ainda está' : 'assuntos estudados ainda estão'} sem revisão agendada.</span><button class="sm" id="go-kanban">Abrir Kanban</button></div>`;
   if (atras.length) h += `<section class="section"><div class="section-head"><h2>Atrasadas</h2><span class="count">${atras.length}</span></div><div class="stack">${atras.map(x => itemHTML(x)).join('')}</div></section>`;
   h += `<section class="section"><div class="section-head"><h2>Hoje · ${fmtDia(t)}</h2><span class="count">${hoje.length}</span></div>${hoje.length ? `<div class="stack">${hoje.map(x => itemHTML(x)).join('')}</div>` : `<div class="empty">Nada programado para hoje${atras.length ? ' — aproveite para colocar as atrasadas em dia' : ''}.</div>`}</section>`;
   h += `<section class="section"><div class="section-head"><h2>Próximos 7 dias</h2><span class="count">${prox.length}</span></div>`;
@@ -329,7 +348,7 @@ function agendaLista(m) {
 }
 function monthItems(mes) {
   const items = [];
-  allDerived().forEach(x => { if (x.d.proximaData.slice(0, 7) === mes) items.push({ date: x.d.proximaData, kind: 'pend', x, cls: statusCls(x), label: `${x.s.disciplina} — ${x.s.assunto}`, ativ: TIPOS[x.d.proximaAtividade].short }); });
+  allDerived().forEach(x => { if (x.d.proximaData && x.d.proximaData.slice(0, 7) === mes) items.push({ date: x.d.proximaData, kind: 'pend', x, cls: statusCls(x), label: `${x.s.disciplina} — ${x.s.assunto}`, ativ: TIPOS[x.d.proximaAtividade].short }); });
   state.history.forEach(h => { if (h.dataRealizada.slice(0, 7) === mes) items.push({ date: h.dataRealizada, kind: 'feita', h, cls: 's-feita', label: `${h.disciplina} — ${h.assunto}`, ativ: `${TIPOS[h.tipo].short}${h.pct != null ? ' · ' + pctFmt(h.pct) : ''}` }); });
   items.sort((a, b) => a.date.localeCompare(b.date) || (a.kind === 'pend' ? -1 : 1)); return items;
 }
@@ -338,7 +357,7 @@ function agendaMes() {
   const startDow = new Date(y, mo - 1, 1).getDay(); const daysIn = new Date(y, mo, 0).getDate(); const t = todayISO();
   const sel = state.ui.diaSel && state.ui.diaSel.slice(0, 7) === mes ? state.ui.diaSel : null; const subMode = state.ui.mesView || 'cal';
   const opts = new Set(); const base = new Date(); for (let i = -3; i <= 12; i++) opts.add(toISO(new Date(base.getFullYear(), base.getMonth() + i, 1)).slice(0, 7));
-  state.history.forEach(h => opts.add(h.dataRealizada.slice(0, 7))); allDerived().forEach(x => opts.add(x.d.proximaData.slice(0, 7))); opts.add(mes);
+  state.history.forEach(h => opts.add(h.dataRealizada.slice(0, 7))); allDerived().forEach(x => { if (x.d.proximaData) opts.add(x.d.proximaData.slice(0, 7)); }); opts.add(mes);
   let h = `<div class="cal-nav"><button class="sm" id="mes-prev" aria-label="Mês anterior">‹</button><h2>${MESES[mo - 1]} ${y}</h2><button class="sm" id="mes-next" aria-label="Próximo mês">›</button></div>`;
   h += `<div class="toolbar"><select id="mes-sel" aria-label="Mês selecionado">${Array.from(opts).sort().map(k => `<option value="${k}" ${k === mes ? 'selected' : ''}>${MESES[Number(k.slice(5, 7)) - 1]}/${k.slice(0, 4)}</option>`).join('')}</select><div class="segment view-toggle"><button data-mesview="cal" class="${subMode === 'cal' ? 'active' : ''}">Calendário</button><button data-mesview="lista" class="${subMode === 'lista' ? 'active' : ''}">Lista</button></div></div>`;
   if (subMode === 'cal') {
@@ -370,6 +389,119 @@ function bindItems(root) {
   $$('[data-open]', root).forEach(el => el.addEventListener('click', () => modalAssunto(el.dataset.open)));
   const en = $('#empty-novo', root); if (en) en.addEventListener('click', () => modalNovoAssunto());
   const ex = $('#empty-exemplo', root); if (ex) ex.addEventListener('click', carregarExemplos);
+  const gk = $('#go-kanban', root); if (gk) gk.addEventListener('click', () => { state.ui.agendaMode = 'kanban'; save(); render(); window.scrollTo({ top: 0 }); });
+}
+
+/* ===================== KANBAN ===================== */
+const COLS = [
+  { id: 'assuntos', nome: 'Assuntos', desc: 'a estudar' },
+  { id: 'estudado', nome: 'Estudado', desc: 'teoria vista' },
+  { id: 'revisar', nome: 'Para revisar', desc: 'hoje, atrasadas e teoria' },
+  { id: 'revisado', nome: 'Revisado', desc: 'próxima revisão agendada' },
+  { id: 'concluido', nome: 'Concluído', desc: 'domínio consolidado' },
+];
+const colNome = id => (COLS.find(c => c.id === id) || {}).nome || id;
+function kanbanCard(x) {
+  const { s, d } = x; const chips = [];
+  const prazoChip = txt => `<span class="chip ${d.prazo === 'atrasada' ? 's-atrasada' : d.prazo === 'hoje' ? 's-hoje' : ''}">${txt}</span>`;
+  if (d.coluna === 'assuntos') { if (d.proximaData) chips.push(prazoChip(`estudar ${d.prazo === 'hoje' ? 'hoje' : fmtBR(d.proximaData)}`)); }
+  else if (s.concluido) chips.push('<span class="chip s-feita">CONCLUÍDO</span>');
+  else if (!d.proximaData) chips.push('<span class="chip">sem revisão agendada</span>');
+  else { chips.push(chipTipo(d.proximaAtividade)); chips.push(prazoChip(d.prazo === 'atrasada' ? `atrasada ${d.diasAtraso}d` : d.prazo === 'hoje' ? 'hoje' : fmtBR(d.proximaData))); }
+  const revs = `${d.numRevisoes} ${d.numRevisoes === 1 ? 'revisão' : 'revisões'}`;
+  const stats = d.totQuestoes
+    ? `<div class="kstats num"><span><b>${d.totQuestoes}</b> questões</span><span class="ok"><b>${d.totAcertos}</b> acertos</span><span class="err"><b>${d.totErros}</b> erros</span><span><b>${d.pctGeral}%</b></span></div><div class="kmeta">${revs} · última ${pctFmt(d.ultimoPct)}${d.nivel.n ? ' · ' + NIVEIS[d.nivel.n].emoji : ''}${d.nivel.tend > 0 ? ' ↗' : d.nivel.tend < 0 ? ' ↘' : ''}</div>`
+    : `<div class="kmeta">${d.numRevisoes ? revs + ' · ' : ''}sem questões registradas</div>`;
+  return `<div class="kcard ${statusCls(x)}" draggable="true" data-kid="${s.id}" data-open="${s.id}"><div class="khead"><span class="eyebrow kdisc">${esc(s.disciplina)}</span><button class="ghost sm kmove" data-mover="${s.id}" aria-label="Mover ${esc(s.assunto)}" title="Mover para outra coluna">⋯</button></div><strong class="ktitle">${esc(s.assunto)}</strong>${chips.length ? `<div class="kchips">${chips.join('')}</div>` : ''}${stats}</div>`;
+}
+function kanbanLista() {
+  const f = state.ui.kfiltro || {}; const q = normNome(f.q);
+  return allDerived().filter(x => (!q || normNome(x.s.assunto + ' ' + x.s.disciplina).includes(q)) && (!f.disc || x.s.disciplina === f.disc));
+}
+function agendaKanban() {
+  const f = state.ui.kfiltro || {};
+  const discs = Array.from(new Set(state.subjects.map(s => s.disciplina))).sort((a, b) => a.localeCompare(b, 'pt'));
+  const list = kanbanLista();
+  const porDisc = (a, b) => a.s.disciplina.localeCompare(b.s.disciplina, 'pt') || a.s.numero - b.s.numero;
+  const porData = (a, b) => (a.d.proximaData || '9999').localeCompare(b.d.proximaData || '9999') || porDisc(a, b);
+  let h = `<div class="toolbar"><input class="search" id="k-q" placeholder="Buscar assunto…" value="${esc(f.q || '')}"><select id="k-disc" aria-label="Disciplina"><option value="">Todas as disciplinas</option>${discs.map(d => `<option ${f.disc === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select></div>`;
+  if (!state.subjects.length) return h + `<div class="empty"><p><strong>Nenhum assunto ainda.</strong></p><div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap"><button class="primary" id="k-importar">Importar lista de assuntos</button></div></div>`;
+  h += `<p class="small muted" style="margin-bottom:10px">Arraste os cards entre as colunas, ou toque em ⋯ para mover. O que muda aqui muda também na agenda.</p><div class="kanban">`;
+  COLS.forEach(c => {
+    const items = list.filter(x => x.d.coluna === c.id).sort(c.id === 'assuntos' || c.id === 'concluido' ? porDisc : porData);
+    const semData = c.id === 'estudado' ? items.filter(x => !x.d.proximaData && x.d.numRevisoes === 0).length : 0;
+    h += `<section class="kcol" data-col="${c.id}"><header class="kcol-head"><div><h3>${c.nome}</h3><span class="small muted">${c.desc}</span></div><span class="kcount num">${items.length}</span></header>`;
+    if (semData) h += `<div class="kcol-tools"><button class="sm primary" id="k-lote">Agendar ${semData} ${semData === 1 ? 'revisão' : 'revisões'}</button></div>`;
+    h += `<div class="kcol-body" data-drop="${c.id}">${items.length ? items.map(kanbanCard).join('') : '<div class="kempty">Arraste um card para cá</div>'}</div></section>`;
+  });
+  return h + `</div>`;
+}
+function bindKanban() {
+  const upd = () => { state.ui.kfiltro = { q: $('#k-q').value, disc: $('#k-disc').value }; save(); render(); if (state.ui._focusK) { const i = $('#k-q'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); } };
+  $('#k-q').addEventListener('input', () => { state.ui._focusK = true; upd(); });
+  $('#k-disc').addEventListener('change', () => { state.ui._focusK = false; upd(); });
+  const imp = $('#k-importar'); if (imp) imp.addEventListener('click', () => { const n = importarLista(); render(); toast(`${n} assuntos importados`); });
+  const lote = $('#k-lote'); if (lote) lote.addEventListener('click', () => modalAgendarLote(kanbanLista().filter(x => x.d.coluna === 'estudado' && !x.d.proximaData && x.d.numRevisoes === 0).map(x => x.s)));
+  $$('[data-mover]', view).forEach(b => b.addEventListener('click', e => { e.stopPropagation(); modalMover(b.dataset.mover); }));
+  $$('.kcard', view).forEach(c => {
+    c.addEventListener('dragstart', e => { e.dataTransfer.setData('text/plain', c.dataset.kid); e.dataTransfer.effectAllowed = 'move'; c.classList.add('dragging'); });
+    c.addEventListener('dragend', () => { c.classList.remove('dragging'); $$('.kcol-body.over', view).forEach(z => z.classList.remove('over')); });
+  });
+  $$('[data-drop]', view).forEach(z => {
+    z.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; z.classList.add('over'); });
+    z.addEventListener('dragleave', e => { if (!z.contains(e.relatedTarget)) z.classList.remove('over'); });
+    z.addEventListener('drop', e => { e.preventDefault(); z.classList.remove('over'); const id = e.dataTransfer.getData('text/plain'); if (id) moveTo(id, z.dataset.drop); });
+  });
+}
+// Move um assunto de coluna e aplica a ação equivalente na agenda.
+function moveTo(id, col) {
+  const s = findSubject(id); if (!s) return; const d = derive(s); const t = todayISO();
+  if (d.coluna === col) return;
+  const done = msg => { dbUpsertSubject(s); save(); render(); toast(msg); };
+  if (col === 'concluido') {
+    if (!confirm(`Marcar "${s.assunto}" como concluído?\n\nEle sai da agenda e não gera novas revisões. Para reativar, mova o card para outra coluna.`)) return;
+    s.concluido = true; s.ajuste = null; return done('Assunto concluído e retirado da agenda');
+  }
+  if (col === 'assuntos') {
+    if (d.numRevisoes) return toast('Este assunto já tem revisões. Para voltar, desfaça as revisões no Histórico.');
+    Object.assign(s, { estudoRealizado: false, dataEstudo: null, ajuste: null, concluido: false }); return done('Voltou para Assuntos, fora da agenda');
+  }
+  if (!s.estudoRealizado) { s.concluido = false; return modalRegistrar(id, 'Registre o estudo da teoria. A 1ª revisão por questões entra na agenda automaticamente.'); }
+  if (col === 'estudado') {
+    if (d.numRevisoes) return toast('Este assunto já foi revisado. Ele só volta para Estudado se as revisões forem desfeitas no Histórico.');
+    s.concluido = false; s.ajuste = { ref: 'inicio', semAgenda: true }; return done('Revisão retirada da agenda');
+  }
+  if (col === 'revisar') { s.concluido = false; const d2 = derive(s); s.ajuste = { ref: d2.ref, data: t }; return done(`${TIPOS[d2.proximaAtividade].label} agendada para hoje`); }
+  if (col === 'revisado') return modalRegistrar(id);
+}
+function modalMover(id) {
+  const s = findSubject(id); if (!s) return; const d = derive(s);
+  const acao = { assuntos: 'volta a estudar e sai da agenda', estudado: s.estudoRealizado ? 'tira a revisão da agenda' : 'registra o estudo da teoria', revisar: s.estudoRealizado ? 'agenda a revisão para hoje' : 'registra o estudo da teoria', revisado: s.estudoRealizado ? 'registra questões e acertos' : 'registra o estudo da teoria', concluido: 'sai da agenda' };
+  openModal(`<div class="stack" style="gap:12px"><div><span class="eyebrow">${esc(s.disciplina)}</span><h2>${esc(s.assunto)}</h2><p class="small muted">Está em <strong>${colNome(d.coluna)}</strong>. Mover para:</p></div><div class="move-list">${COLS.map(c => `<button data-col="${c.id}" ${c.id === d.coluna ? 'disabled' : ''}>${c.nome}<small>${c.id === d.coluna ? 'coluna atual' : acao[c.id]}</small></button>`).join('')}</div><div class="actions"><button data-close>Cancelar</button></div></div>`, bg => {
+    $$('[data-col]', bg).forEach(b => b.addEventListener('click', () => { closeModal(); moveTo(id, b.dataset.col); }));
+  });
+}
+function distribuirLote(subs, porDia, inicio) {
+  const grupos = {}; subs.forEach(s => (grupos[s.disciplina] = grupos[s.disciplina] || []).push(s));
+  const filas = Object.values(grupos); const ordem = [];
+  while (filas.some(f => f.length)) filas.forEach(f => { if (f.length) ordem.push(f.shift()); });
+  return ordem.map((s, i) => ({ s, data: addDays(inicio, Math.floor(i / porDia)) }));
+}
+function modalAgendarLote(subs) {
+  if (!subs.length) return toast('Nenhum assunto estudado sem revisão.'); const t = todayISO();
+  openModal(`<form id="f-lote" class="stack" style="gap:12px"><h2>Agendar revisões</h2><p class="small muted">${subs.length} ${subs.length === 1 ? 'assunto estudado está' : 'assuntos estudados estão'} sem revisão agendada. O app distribui as primeiras revisões por questões ao longo dos dias, alternando as disciplinas.</p>
+    <div class="row2"><label>Revisões por dia<input type="number" name="porDia" min="1" max="50" value="5" inputmode="numeric" required></label><label>A partir de<input type="date" name="inicio" value="${t}" required></label></div>
+    <div class="preview" id="lote-prev"></div><div class="actions"><button type="button" data-close>Cancelar</button><button class="primary" type="submit">Agendar</button></div></form>`, () => {
+    const f = $('#f-lote');
+    const prev = () => { const n = Math.max(1, Number(f.porDia.value) || 1); const ini = f.inicio.value || t; const dias = Math.ceil(subs.length / n); $('#lote-prev').innerHTML = `<span>${subs.length} ${subs.length === 1 ? 'revisão' : 'revisões'}, ${n} por dia: de <strong class="num">${fmtBRFull(ini)}</strong> a <strong class="num">${fmtBRFull(addDays(ini, dias - 1))}</strong> (${dias} ${dias === 1 ? 'dia' : 'dias'}).</span>`; };
+    f.porDia.addEventListener('input', prev); f.inicio.addEventListener('input', prev); prev();
+    f.addEventListener('submit', e => {
+      e.preventDefault(); const n = Math.max(1, Number(f.porDia.value) || 1);
+      const plano = distribuirLote(subs, n, f.inicio.value || t);
+      plano.forEach(({ s, data }) => { s.ajuste = { ref: 'inicio', data }; s.concluido = false; });
+      dbUpsertSubjects(plano.map(p => p.s)); save(true); closeModal(); render(); toast(`${plano.length} revisões agendadas`);
+    });
+  });
 }
 
 /* ===================== PAINEL ===================== */
@@ -383,7 +515,7 @@ function renderPainel(m) {
   h += `<div class="card chart-card"><h3>Evolução da porcentagem de acertos</h3><p class="small muted" style="margin-bottom:8px">Cada ponto é uma revisão por questões, em ordem cronológica.</p>${chartEvolucao()}<div class="tip" id="tip-evo"></div></div>`;
   h += `<div class="card chart-card"><h3>Revisões realizadas por semana</h3><p class="small muted" style="margin-bottom:8px">Últimas 10 semanas (semana começa na segunda).</p>${chartSemanas()}<div class="tip" id="tip-sem"></div></div>`;
   h += `<div class="card"><h3>Distribuição por nível de domínio</h3><p class="small muted" style="margin-bottom:8px">Baseado no desempenho mais recente de cada assunto.</p>${chartDominio(m)}</div>`;
-  const teor = m.all.filter(x => x.d.proximaAtividade === 'TEORIA').sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData));
+  const teor = m.ag.filter(x => x.d.proximaAtividade === 'TEORIA').sort((a, b) => a.d.proximaData.localeCompare(b.d.proximaData));
   h += `<div class="card"><h3>Precisam de revisão teórica</h3><p class="small muted" style="margin-bottom:8px">Acertos abaixo de ${cfg().limiteTeoria}% na última bateria.</p>${teor.length ? `<div class="stack">${teor.map(x => itemHTML(x, { showDate: true })).join('')}</div>` : '<div class="empty">Nenhum assunto precisa de revisão teórica agora.</div>'}</div></div>`;
   view.innerHTML = h; bindItems(view); bindChartTips();
 }
@@ -428,9 +560,9 @@ function renderAssuntos(m) {
   const discs = Array.from(new Set(cfg().disciplinas.concat(state.subjects.map(s => s.disciplina)))).sort();
   const list = m.all.filter(x => (!q || (x.s.assunto + ' ' + x.s.disciplina + ' ' + (x.s.obs || '')).toLowerCase().includes(q)) && (!f.disc || x.s.disciplina === f.disc) && (!f.status || x.d.status === f.status || (f.status === 'atrasada' && x.d.prazo === 'atrasada')));
   const sort = f.sort || 'proxima';
-  list.sort((a, b) => sort === 'proxima' ? a.d.proximaData.localeCompare(b.d.proximaData) : sort === 'nivel' ? a.d.nivel.n - b.d.nivel.n : sort === 'disc' ? (a.s.disciplina + a.s.assunto).localeCompare(b.s.disciplina + b.s.assunto) : b.s.numero - a.s.numero);
+  list.sort((a, b) => sort === 'proxima' ? (a.d.proximaData || '9999').localeCompare(b.d.proximaData || '9999') : sort === 'nivel' ? a.d.nivel.n - b.d.nivel.n : sort === 'disc' ? (a.s.disciplina + a.s.assunto).localeCompare(b.s.disciplina + b.s.assunto) : b.s.numero - a.s.numero);
   const sv = state.ui.subjView || 'cards';
-  let h = `<div class="toolbar"><input class="search" id="f-q" placeholder="Buscar assunto…" value="${esc(f.q || '')}"><select id="f-disc"><option value="">Todas disciplinas</option>${discs.map(d => `<option ${f.disc === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select><select id="f-status"><option value="">Todos os status</option>${['Planejado', 'Em revisão', 'Revisar teoria', 'Manutenção'].map(s => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}<option value="atrasada" ${f.status === 'atrasada' ? 'selected' : ''}>Atrasadas</option></select><select id="f-sort"><option value="proxima" ${sort === 'proxima' ? 'selected' : ''}>Por próxima data</option><option value="disc" ${sort === 'disc' ? 'selected' : ''}>Por disciplina</option><option value="nivel" ${sort === 'nivel' ? 'selected' : ''}>Por domínio (menor primeiro)</option><option value="id" ${sort === 'id' ? 'selected' : ''}>Mais recentes</option></select><div class="segment"><button data-sv="cards" class="${sv === 'cards' ? 'active' : ''}">Cards</button><button data-sv="tabela" class="${sv === 'tabela' ? 'active' : ''}">Tabela</button></div></div><p class="small muted" style="margin-bottom:10px">${list.length} de ${m.total} assuntos</p>`;
+  let h = `<div class="toolbar"><input class="search" id="f-q" placeholder="Buscar assunto…" value="${esc(f.q || '')}"><select id="f-disc"><option value="">Todas disciplinas</option>${discs.map(d => `<option ${f.disc === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select><select id="f-status"><option value="">Todos os status</option>${['A estudar', 'Estudado', 'Em revisão', 'Revisar teoria', 'Manutenção', 'Concluído'].map(s => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}<option value="atrasada" ${f.status === 'atrasada' ? 'selected' : ''}>Atrasadas</option></select><select id="f-sort"><option value="proxima" ${sort === 'proxima' ? 'selected' : ''}>Por próxima data</option><option value="disc" ${sort === 'disc' ? 'selected' : ''}>Por disciplina</option><option value="nivel" ${sort === 'nivel' ? 'selected' : ''}>Por domínio (menor primeiro)</option><option value="id" ${sort === 'id' ? 'selected' : ''}>Mais recentes</option></select><div class="segment"><button data-sv="cards" class="${sv === 'cards' ? 'active' : ''}">Cards</button><button data-sv="tabela" class="${sv === 'tabela' ? 'active' : ''}">Tabela</button></div></div><p class="small muted" style="margin-bottom:10px">${list.length} de ${m.total} assuntos</p>`;
   if (!list.length) h += `<div class="empty">Nenhum assunto encontrado.</div>`;
   else if (sv === 'cards') h += `<div class="subj-cards">${list.map(x => { const { s, d } = x; return `<div class="subj-card ${statusCls(x)}" data-open="${s.id}"><div class="title" style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start"><div><div class="eyebrow">${esc(s.disciplina)} · #${s.numero}</div><strong>${esc(s.assunto)}</strong></div>${chipNivel(d.nivel)}</div><div style="display:flex;gap:6px;flex-wrap:wrap">${chipTipo(d.proximaAtividade)}${d.prazo === 'atrasada' ? '<span class="chip s-atrasada">ATRASADA</span>' : d.prazo === 'hoje' ? '<span class="chip s-hoje">HOJE</span>' : ''}</div><div class="kv"><b>Próxima</b><span class="num">${fmtBRFull(d.proximaData)}${d.intervalo ? ` (+${d.intervalo}d)` : ''}</span><b>Estudo inicial</b><span class="num">${fmtBRFull(s.dataEstudo)}</span><b>Última revisão</b><span class="num">${d.ultimaRevisao ? fmtBRFull(d.ultimaRevisao) + ' · ' + TIPOS[d.ultimoTipo].label : '—'}</span><b>Último resultado</b><span class="num">${d.ultimoPct != null ? `${d.ultimosAcertos}/${d.ultimasQuestoes} · ${pctFmt(d.ultimoPct)}` : '—'}</span><b>Revisões</b><span class="num">${d.numRevisoes}</span><b>Status</b><span>${d.status}</span></div>${s.obs ? `<p class="small muted">${esc(s.obs)}</p>` : ''}<div style="display:flex;justify-content:flex-end"><button class="primary sm" data-registrar="${s.id}">${acaoLabel(d.proximaAtividade)}</button></div></div>`; }).join('')}</div>`;
   else {
@@ -477,7 +609,7 @@ function renderConfig() {
     <label>Escada de manutenção (dias, separados por vírgula) — usada quando o desempenho se mantém ≥ ${c.faixas[c.faixas.length - 1].min}% em revisões seguidas<input id="c-manut" value="${c.manutencao.join(', ')}"></label>
     <label>Disciplinas (separadas por vírgula)<input id="c-disc" value="${esc(c.disciplinas.join(', '))}"></label>
     <div class="actions" style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap"><button type="button" id="c-reset">Restaurar padrões</button><button class="primary" type="submit">Salvar configurações</button></div></div></form>
-  <div class="card stack"><h2>Dados e backup</h2><p class="small muted">Tudo é salvo na nuvem automaticamente (e em cache neste aparelho para funcionar offline). O backup em arquivo é opcional.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button id="d-export">Exportar backup (JSON)</button><button id="d-import">Importar backup</button><input type="file" id="d-file" accept="application/json,.json" hidden><button id="d-csv">Histórico em CSV</button></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button id="d-exemplos">Carregar exemplos</button><button id="d-rm-exemplos">Remover exemplos</button><button class="danger" id="d-wipe">Apagar tudo</button></div><p class="small muted">Assuntos: ${state.subjects.length} · Revisões: ${state.history.length}</p></div>
+  <div class="card stack"><h2>Dados e backup</h2><p class="small muted">Tudo é salvo na nuvem automaticamente (e em cache neste aparelho para funcionar offline). O backup em arquivo é opcional.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button id="d-export">Exportar backup (JSON)</button><button id="d-import">Importar backup</button><input type="file" id="d-file" accept="application/json,.json" hidden><button id="d-csv">Histórico em CSV</button></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button id="d-lista">Importar lista de assuntos</button><button id="d-exemplos">Carregar exemplos</button><button id="d-rm-exemplos">Remover exemplos</button><button class="danger" id="d-wipe">Apagar tudo</button></div><p class="small muted">Assuntos: ${state.subjects.length} · Revisões: ${state.history.length}</p></div>
   <div class="card stack help"><h2>Como usar no dia a dia</h2>
     <details open><summary>Quando estudar um conteúdo novo</summary><ol><li>Toque em <strong>+ Novo assunto</strong>.</li><li>Preencha disciplina, assunto e a data em que estudou a teoria.</li><li>Pronto: a 1ª revisão por questões entra na agenda em ${c.primeiraRevisao.padrao} dia (ou 2, se você escolher).</li></ol></details>
     <details><summary>Quando fizer uma revisão</summary><ol><li>Abra a <strong>Agenda</strong>: o que é de hoje e o que está atrasado aparece no topo.</li><li>Toque em <strong>Registrar</strong> e informe questões feitas e acertos.</li><li>O app calcula a %, o nível de domínio, a próxima atividade e a data. Se ficou abaixo de ${c.limiteTeoria}%, ele agenda <strong>Revisar teoria</strong>; depois de marcar a teoria como feita, agenda questões em ${c.posTeoria.padrao} dia.</li></ol></details>
@@ -503,8 +635,9 @@ function renderConfig() {
   $('#d-file').addEventListener('change', e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => { try { const raw = JSON.parse(r.result); if (!raw.subjects || !raw.history) throw 0; const data = normalizeImport(raw); if (!confirm(`Importar ${data.subjects.length} assuntos e ${data.history.length} revisões? Isso substitui os dados atuais (também na nuvem).`)) return; replaceAll(data); render(); toast('Backup importado'); } catch (err) { toast('Arquivo inválido.'); } }; r.readAsText(f); e.target.value = ''; });
   $('#d-csv').addEventListener('click', exportCSV);
   $('#d-exemplos').addEventListener('click', carregarExemplos);
+  $('#d-lista').addEventListener('click', () => { const n = importarLista(); render(); toast(n ? `${n} assuntos importados` : 'Todos os assuntos da lista já estão cadastrados'); });
   $('#d-rm-exemplos').addEventListener('click', () => { const n = state.subjects.filter(s => s.exemplo).length; if (!n) return toast('Não há exemplos carregados.'); state.subjects = state.subjects.filter(s => !s.exemplo); state.history = state.history.filter(h => !h.exemplo); dbDelete('subjects', { exemplo: true }); save(true); render(); toast(`${n} exemplos removidos`); });
-  $('#d-wipe').addEventListener('click', () => { if (confirm('Apagar TODOS os assuntos, revisões e configurações (neste aparelho e na nuvem)? Esta ação não pode ser desfeita.') && confirm('Tem certeza? Exporte um backup antes se quiser guardar os dados.')) { Object.assign(state, blankData()); enqueue({ table: 'reviews', op: 'deleteAll' }); enqueue({ table: 'subjects', op: 'deleteAll' }); dbSaveConfig(); save(true); render(); toast('Tudo apagado'); } });
+  $('#d-wipe').addEventListener('click', () => { if (confirm('Apagar TODOS os assuntos, revisões e configurações (neste aparelho e na nuvem)? Esta ação não pode ser desfeita.') && confirm('Tem certeza? Exporte um backup antes se quiser guardar os dados.')) { Object.assign(state, blankData()); state.config.listaImportada = true; enqueue({ table: 'reviews', op: 'deleteAll' }); enqueue({ table: 'subjects', op: 'deleteAll' }); dbSaveConfig(); save(true); render(); toast('Tudo apagado'); } });
 }
 function download(name, content, type) {
   try { const blob = new Blob([content], { type }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
@@ -525,7 +658,7 @@ function modalNovoAssunto(existing) {
   const html = `<form id="f-novo" class="stack" style="gap:12px"><h2>${s ? 'Editar assunto' : 'Novo assunto estudado'}</h2>${discOptions()}
     <label>Disciplina<input name="disciplina" list="dl-disc" required placeholder="Ex.: Pediatria" value="${esc(s ? s.disciplina : '')}" autocomplete="off"></label>
     <label>Assunto<input name="assunto" required placeholder="Ex.: Bronquiolite" value="${esc(s ? s.assunto : '')}"></label>
-    <div class="row2"><label>Data do estudo da teoria<input type="date" name="dataEstudo" required value="${s ? s.dataEstudo : t}"></label><label>&nbsp;<span class="inline" style="display:flex;align-items:center;gap:8px;min-height:40px"><input type="checkbox" name="estudoRealizado" id="n-real" ${!s || s.estudoRealizado ? 'checked' : ''}> <span style="font-weight:500;color:var(--ink)">Estudo inicial realizado</span></span></label></div>
+    <div class="row2"><label>Data do estudo (ou planejada)<input type="date" name="dataEstudo" value="${s ? (s.dataEstudo || '') : t}"></label><label>&nbsp;<span class="inline" style="display:flex;align-items:center;gap:8px;min-height:40px"><input type="checkbox" name="estudoRealizado" id="n-real" ${!s || s.estudoRealizado ? 'checked' : ''}> <span style="font-weight:500;color:var(--ink)">Estudo inicial realizado</span></span></label></div>
     <div id="n-first" ${(s && subjectHistory(s.id).length) ? 'hidden' : ''}><span class="eyebrow">1ª revisão por questões</span><div class="radio-group" style="margin-top:6px">${[...Array(c.primeiraRevisao.max + 1).keys()].filter(n => n >= 1 || c.primeiraRevisao.padrao === 0).map(n => `<label class="inline"><input type="radio" name="prd" value="${n}" ${(s ? (s.primeiraRevisaoDias ?? c.primeiraRevisao.padrao) : c.primeiraRevisao.padrao) === n ? 'checked' : ''}> +${n} ${n === 1 ? 'dia' : 'dias'}</label>`).join('')}</div><p class="small muted" style="margin-top:4px">Nunca depois de ${c.primeiraRevisao.max * 24}h do estudo. Se não marcou "estudo realizado", o estudo entra na agenda na data acima.</p></div>
     <label>Observações<textarea name="obs" placeholder="Opcional">${esc(s ? s.obs : '')}</textarea></label>
     <div class="actions">${s ? `<div class="left"><button type="button" class="danger" id="n-del">Excluir assunto</button></div>` : ''}<button type="button" data-close>Cancelar</button><button class="primary" type="submit">${s ? 'Salvar' : 'Cadastrar'}</button></div></form>`;
@@ -534,16 +667,17 @@ function modalNovoAssunto(existing) {
       e.preventDefault(); const fd = new FormData(e.target);
       const data = { disciplina: fd.get('disciplina'), assunto: fd.get('assunto'), dataEstudo: fd.get('dataEstudo'), estudoRealizado: fd.get('estudoRealizado') === 'on', primeiraRevisaoDias: Number(fd.get('prd') ?? c.primeiraRevisao.padrao), obs: fd.get('obs') };
       if (!data.disciplina.trim() || !data.assunto.trim()) return toast('Informe disciplina e assunto.');
+      data.dataEstudo = data.dataEstudo || null; if (data.estudoRealizado && !data.dataEstudo) return toast('Informe a data em que estudou a teoria.');
       if (s) { updateSubject(s, { disciplina: data.disciplina.trim(), assunto: data.assunto.trim(), dataEstudo: data.dataEstudo, estudoRealizado: data.estudoRealizado, primeiraRevisaoDias: data.primeiraRevisaoDias, obs: (data.obs || '').trim() }); if (s.disciplina && !c.disciplinas.includes(s.disciplina)) { c.disciplinas.push(s.disciplina); dbSaveConfig(); } closeModal(); toast('Assunto atualizado'); render(); return; }
       const ns = addSubject(data); const d = derive(ns); closeModal(); render();
-      toast(d.proximaAtividade === 'ESTUDO' ? `Estudo agendado para ${fmtBR(d.proximaData)}` : `1ª revisão por questões em ${fmtBR(d.proximaData)}`);
+      toast(d.proximaAtividade === 'ESTUDO' ? (d.proximaData ? `Estudo agendado para ${fmtBR(d.proximaData)}` : 'Assunto adicionado à coluna Assuntos') : `1ª revisão por questões em ${fmtBR(d.proximaData)}`);
     });
     const del = $('#n-del', bg); if (del) del.addEventListener('click', () => { if (confirm(`Excluir "${s.assunto}" e todo o seu histórico?`)) { removeSubject(s.id); closeModal(); render(); toast('Assunto excluído'); } });
   });
 }
-function modalRegistrar(id) {
+function modalRegistrar(id, aviso) {
   const s = findSubject(id); if (!s) return; const d = derive(s); const tipo = d.proximaAtividade; const c = cfg(); const t = todayISO();
-  const head = `<h2>${tipo === 'ESTUDO' ? 'Marcar estudo inicial' : tipo === 'TEORIA' ? 'Marcar revisão teórica' : 'Registrar revisão por questões'}</h2><p class="muted"><span class="eyebrow">${esc(s.disciplina)}</span><br><strong style="color:var(--ink);font-size:1.05rem">${esc(s.assunto)}</strong></p><div style="display:flex;gap:6px;flex-wrap:wrap">${chipTipo(tipo)}<span class="chip">${tipo === 'ESTUDO' ? 'estudo inicial' : 'revisão nº ' + (d.numRevisoes + 1)}</span><span class="chip ${d.prazo === 'atrasada' ? 's-atrasada' : d.prazo === 'hoje' ? 's-hoje' : ''}">programada ${fmtBR(d.proximaData)}${d.prazo === 'atrasada' ? ` · ${d.diasAtraso}d de atraso` : ''}</span></div>`;
+  const head = `<h2>${tipo === 'ESTUDO' ? 'Marcar estudo inicial' : tipo === 'TEORIA' ? 'Marcar revisão teórica' : 'Registrar revisão por questões'}</h2><p class="muted"><span class="eyebrow">${esc(s.disciplina)}</span><br><strong style="color:var(--ink);font-size:1.05rem">${esc(s.assunto)}</strong></p><div style="display:flex;gap:6px;flex-wrap:wrap">${chipTipo(tipo)}<span class="chip">${tipo === 'ESTUDO' ? 'estudo inicial' : 'revisão nº ' + (d.numRevisoes + 1)}</span>${d.proximaData ? `<span class="chip ${d.prazo === 'atrasada' ? 's-atrasada' : d.prazo === 'hoje' ? 's-hoje' : ''}">programada ${fmtBR(d.proximaData)}${d.prazo === 'atrasada' ? ` · ${d.diasAtraso}d de atraso` : ''}</span>` : '<span class="chip">sem data na agenda</span>'}</div>${aviso ? `<p class="small muted">${aviso}</p>` : ''}`;
   let body = '';
   if (isQuestoes(tipo)) body = `<div class="row2"><label>Questões feitas<input type="number" name="questoes" min="1" inputmode="numeric" placeholder="${c.questoesRecomendadas}" required></label><label>Acertos<input type="number" name="acertos" min="0" inputmode="numeric" required></label></div><div class="preview" id="reg-preview"><span class="muted">Informe questões e acertos para ver a próxima etapa.</span></div>`;
   else if (tipo === 'TEORIA') body = `<div class="preview"><span>Ao marcar como feita, o app programa <b>questões após a teoria</b> em ${c.posTeoria.padrao} ${c.posTeoria.padrao === 1 ? 'dia' : 'dias'} (máx. ${c.posTeoria.max * 24}h).</span></div>`;
@@ -573,7 +707,7 @@ function modalAssunto(id) {
   const f = d.last && isQuestoes(d.last.tipo) ? faixaFor(d.last.pct) : null;
   const faixaTxt = f ? ` · faixa ${f.intMin}–${f.intMax} d` : d.ref === 'inicio' && s.estudoRealizado ? ` · até ${c.primeiraRevisao.max} d` : d.proximaAtividade === 'QUESTOES_POS_TEORIA' ? ` · até ${c.posTeoria.max} d` : '';
   const html = `<div class="stack" style="gap:12px"><div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start"><div><span class="eyebrow">${esc(s.disciplina)} · #${s.numero}${s.exemplo ? ' · exemplo' : ''}</span><h2 style="font-size:1.2rem">${esc(s.assunto)}</h2></div>${chipNivel(d.nivel)}</div>
-    <div class="preview"><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${chipTipo(d.proximaAtividade)}${d.prazo === 'atrasada' ? `<span class="chip s-atrasada">ATRASADA · ${d.diasAtraso}d</span>` : d.prazo === 'hoje' ? '<span class="chip s-hoje">HOJE</span>' : ''}</div><b class="num">${fmtDiaLongo(d.proximaData)}</b><span class="small muted">Intervalo calculado: ${d.intervalo} ${d.intervalo === 1 ? 'dia' : 'dias'}${faixaTxt}${d.ajustada ? ' · data ajustada manualmente' : ''}</span><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px"><input type="date" id="a-data" value="${d.proximaData}" style="width:auto;min-height:36px;padding:4px 8px"><button class="sm" id="a-ajustar">Ajustar data</button><button class="sm" id="a-adiar">Adiar +1 dia</button></div></div>
+    <div class="preview"><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${chipTipo(d.proximaAtividade)}${d.prazo === 'atrasada' ? `<span class="chip s-atrasada">ATRASADA · ${d.diasAtraso}d</span>` : d.prazo === 'hoje' ? '<span class="chip s-hoje">HOJE</span>' : ''}</div><b class="num">${d.proximaData ? fmtDiaLongo(d.proximaData) : s.concluido ? 'Concluído, fora da agenda' : 'Sem data na agenda'}</b><span class="small muted">Intervalo calculado: ${d.intervalo} ${d.intervalo === 1 ? 'dia' : 'dias'}${faixaTxt}${d.ajustada ? ' · data ajustada manualmente' : ''}</span><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px"><input type="date" id="a-data" value="${d.proximaData || todayISO()}" style="width:auto;min-height:36px;padding:4px 8px"><button class="sm" id="a-ajustar">${d.proximaData ? 'Ajustar data' : 'Agendar'}</button>${d.proximaData ? '<button class="sm" id="a-adiar">Adiar +1 dia</button>' : ''}</div></div>
     <div class="kv small" style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px"><b class="muted">Status</b><span>${d.status}</span><b class="muted">Estudo inicial</b><span class="num">${fmtBRFull(s.dataEstudo)}${s.estudoRealizado ? '' : ' (ainda não realizado)'}</span><b class="muted">Última revisão</b><span class="num">${d.ultimaRevisao ? `${fmtBRFull(d.ultimaRevisao)} · ${TIPOS[d.ultimoTipo].label}` : '—'}</span><b class="muted">Último resultado</b><span class="num">${d.ultimoPct != null ? `${d.ultimosAcertos}/${d.ultimasQuestoes} · ${pctFmt(d.ultimoPct)}` : '—'}</span><b class="muted">Domínio</b><span>${nivelTexto(d.nivel)}</span>${s.obs ? `<b class="muted">Obs.</b><span>${esc(s.obs)}</span>` : ''}</div>
     <div><span class="eyebrow">Histórico (${hist.length})</span>${hist.length ? `<div class="hist-list" style="margin-top:6px">${hist.map(h => `<div class="hist-row"><span class="num">${fmtBR(h.dataRealizada)}</span><span>${TIPOS[h.tipo].short}${h.pct != null ? ` · <strong class="num">${pctFmt(h.pct)}</strong> (${h.acertos}/${h.questoes})` : ''}${h.obs ? `<br><span class="muted">${esc(h.obs)}</span>` : ''}</span><span class="muted num">→ ${h.proximoIntervalo}d</span></div>`).join('')}</div>` : '<p class="small muted" style="margin-top:4px">Nenhuma revisão registrada.</p>'}</div>
     <div class="actions"><div class="left"><button class="sm" id="a-editar">Editar</button>${hist.length ? '<button class="sm ghost danger" id="a-undo">Desfazer última</button>' : ''}</div><button data-close>Fechar</button><button class="primary" id="a-reg">${acaoLabel(d.proximaAtividade)}</button></div></div>`;
@@ -581,9 +715,9 @@ function modalAssunto(id) {
     $('#a-reg').addEventListener('click', () => modalRegistrar(id));
     $('#a-editar').addEventListener('click', () => modalNovoAssunto(s));
     const undo = $('#a-undo', bg); if (undo) undo.addEventListener('click', () => { if (confirm('Desfazer a última revisão deste assunto?')) { desfazerUltima(id); toast('Revisão desfeita'); modalAssunto(id); render(); } });
-    const aplicar = iso => { if (!iso) return; ajustarData(id, iso); const dd = derive(s); let warn = ''; if (dd.ref === 'inicio' && s.estudoRealizado && diffDays(s.dataEstudo, iso) > c.primeiraRevisao.max) warn = ` · atenção: passou de ${c.primeiraRevisao.max * 24}h do estudo`; else if (f && diffDays(d.last.dataRealizada, iso) > f.intMax) warn = ` · atenção: acima do máximo da faixa (${f.intMax}d)`; toast(`Próxima data: ${fmtBR(iso)}${warn}`); modalAssunto(id); render(); };
+    const aplicar = iso => { if (!iso) return; ajustarData(id, iso); const dd = derive(s); let warn = ''; if (dd.ref === 'inicio' && s.estudoRealizado && s.dataEstudo && diffDays(s.dataEstudo, iso) > c.primeiraRevisao.max) warn = ` · atenção: passou de ${c.primeiraRevisao.max * 24}h do estudo`; else if (f && diffDays(d.last.dataRealizada, iso) > f.intMax) warn = ` · atenção: acima do máximo da faixa (${f.intMax}d)`; toast(`Próxima data: ${fmtBR(iso)}${warn}`); modalAssunto(id); render(); };
     $('#a-ajustar').addEventListener('click', () => aplicar($('#a-data').value));
-    $('#a-adiar').addEventListener('click', () => aplicar(addDays(d.proximaData, 1)));
+    const adiar = $('#a-adiar', bg); if (adiar) adiar.addEventListener('click', () => aplicar(addDays(d.proximaData, 1)));
   });
 }
 function modalSenha() {

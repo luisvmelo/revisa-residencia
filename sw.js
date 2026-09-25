@@ -1,11 +1,12 @@
 /* Revisa Residência — service worker (app shell offline) */
-const VERSION = 'revisa-v2.0.0';
+const VERSION = 'revisa-v3.0.0';
 const SHELL = [
   './',
   './index.html',
   './styles.css',
   './app.js',
   './config.js',
+  './assuntos-iniciais.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
